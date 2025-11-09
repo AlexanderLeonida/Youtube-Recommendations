@@ -19,7 +19,7 @@ const db = mysql.createConnection({
   host: process.env.MYSQL_HOST || "mysql",
   user: process.env.MYSQL_USER || "root",
   password: process.env.MYSQL_PASSWORD || "password",
-  database: process.env.MYSQL_DATABASE || "youtube_ai"
+  database: process.env.MYSQL_DATABASE || "ytrecs"
 });
 
 db.connect(err => {
