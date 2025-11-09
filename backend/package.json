@@ -1,6 +1,7 @@
 {
   "name": "youtube-recommendations-backend",
   "version": "1.0.0",
+  "type": "module",
   "description": "Backend server for the YouTube Recommendations AI project",
   "main": "src/index.js",
   "scripts": {

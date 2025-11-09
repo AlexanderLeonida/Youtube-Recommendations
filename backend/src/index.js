@@ -1,7 +1,7 @@
-import express from "express";
-import cors from "cors";
-import dotenv from "dotenv";
-import mysql from "mysql2";
+import express from 'express';
+import mysql from 'mysql2';
+import cors from 'cors';
+import dotenv from 'dotenv';
 
 dotenv.config();
 
@@ -9,26 +9,25 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Test route
-app.get("/api/health", (req, res) => {
-  res.json({ status: "Backend running fine!" });
-});
-
-// Connect to MySQL
 const db = mysql.createConnection({
-  host: process.env.MYSQL_HOST || "mysql",
-  user: process.env.MYSQL_USER || "root",
-  password: process.env.MYSQL_PASSWORD || "password",
-  database: process.env.MYSQL_DATABASE || "ytrecs"
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
 });
 
 db.connect(err => {
   if (err) {
-    console.error("Database connection failed:", err);
+    console.error('Database connection failed:', err);
   } else {
-    console.log("Connected to MySQL successfully.");
+    console.log('Connected to MySQL successfully.');
   }
 });
 
-const PORT = process.env.PORT || 4000;
-app.listen(PORT, () => console.log(`Backend server listening on port ${PORT}`));
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', message: 'Backend is running and connected to MySQL!' });
+});
+
+app.listen(process.env.PORT, () => {
+  console.log(`Backend server listening on port ${process.env.PORT}`);
+});
