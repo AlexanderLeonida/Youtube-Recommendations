@@ -39,5 +39,11 @@ services:
     depends_on:
       - backend
 
+  opencv-service:
+    build: ./opencv
+    container_name: youtube-recommendations-opencv
+    volumes:
+      - ./opencv/output:/app/output
+    command: ["./build/main"]
 volumes:
   mysql-data:
