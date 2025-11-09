@@ -6,7 +6,7 @@ export default function MainApp() {
 
   useEffect(() => {
     axios.get("http://localhost:4000/api/health")
-      .then(res => setStatus(res.data.status))
+      .then(res => setStatus(res.data.message))
       .catch(() => setStatus("Could not connect to backend"));
   }, []);
 
