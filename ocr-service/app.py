@@ -207,12 +207,15 @@ def start_recording():
 @app.route('/api/stop-recording', methods=['POST'])
 def stop_recording():
     """Stop screen recording."""
-    global recording_active
+    global recording_active, recording_thread
     
-    if not recording_active:
-        return jsonify({'error': 'No recording in progress'}), 400
+    # Always stop the recorder regardless of flag state
+    # This allows stopping even if background thread has already finished
+    try:
+        recorder.recorder.stop_recording()
+    except Exception as e:
+        print(f"Error stopping recording: {e}")
     
-    recorder.recorder.stop_recording()
     recording_active = False
     
     return jsonify({'status': 'stopped', 'message': 'Screen recording stopped'})
