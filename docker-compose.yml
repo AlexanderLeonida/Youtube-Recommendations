@@ -21,6 +21,7 @@ services:
   backend:
     build: ./backend
     container_name: youtube-recommendations-backend
+    restart: always
     ports:
       - "4000:4000"
     env_file:
@@ -28,22 +29,52 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+    volumes:
+      - ./backend:/usr/src/app
+      - /usr/src/app/node_modules
+    environment:
+      DB_HOST: mysql
+      DB_USER: ytrecs
+      DB_PASSWORD: password
+      DB_NAME: ytrecs
+      DB_PORT: 3306
 
   frontend:
     build: ./frontend
     container_name: youtube-recommendations-frontend
+    restart: always
     ports:
       - "3000:3000"
     env_file:
       - ./frontend/.env
     depends_on:
       - backend
-
-  opencv-service:
-    build: ./opencv
-    container_name: youtube-recommendations-opencv
     volumes:
-      - ./opencv/output:/app/output
-    command: ["./build/main"]
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      CHOKIDAR_USEPOLLING: "true"
+
+  ocr-service:
+    build: ./ocr-service
+    container_name: youtube-recommendations-ocr
+    restart: always
+    ports:
+      - "5001:5000"
+    environment:
+      DB_HOST: mysql
+      DB_USER: ytrecs
+      DB_PASSWORD: password
+      DB_NAME: ytrecs
+      DB_PORT: 3306
+      PORT: 5000
+      DISPLAY: ${DISPLAY:-:0}
+      ALLOW_HEADLESS_MODE: "true"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
 volumes:
   mysql-data:
