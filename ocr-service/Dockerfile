@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install system dependencies for Tesseract and OpenCV
+# Install system dependencies for Tesseract, OpenCV and Xvfb for virtual display
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-eng \
@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libxrender-dev \
     libgomp1 \
+    xvfb \
+    ffmpeg \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -21,12 +24,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
+# Make start script executable
+RUN chmod +x ./start.sh
+
 # Expose port
 EXPOSE 5000
 
-# Set environment variable for Tesseract
+# Set environment variable for Tesseract (best-effort)
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
-# Run the application
-CMD ["python", "app.py"]
+# Start Xvfb then run the Flask app
+CMD ["./start.sh"]
 

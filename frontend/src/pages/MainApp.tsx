@@ -15,8 +15,13 @@ export default function MainApp() {
   const [isRecording, setIsRecording] = useState(false);
   const [videos, setVideos] = useState<VideoData[]>([]);
   const [isOnYouTube, setIsOnYouTube] = useState(false);
+  const [captureInterval, setCaptureInterval] = useState(2000); // ms between captures
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const checkIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
+  const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureLoopRef = useRef<NodeJS.Timeout | null>(null);
 
   // Check backend connection with retry logic
   useEffect(() => {
@@ -48,96 +53,29 @@ export default function MainApp() {
     checkBackend();
   }, []);
 
-  // Check if user is on YouTube
+  // Check if user is on YouTube (kept for reference, but screen recording makes this less critical)
   useEffect(() => {
     const checkYouTube = () => {
-      // Check if we're in an iframe or if the parent window is YouTube
       try {
         const currentUrl = window.location.href;
         const isYouTube = currentUrl.includes('youtube.com') || 
                          currentUrl.includes('youtu.be') ||
                          (window.parent && window.parent.location.href.includes('youtube.com'));
-        
-        setIsOnYouTube(prev => {
-          if (prev !== isYouTube) {
-            if (isYouTube && !isRecording) {
-              // Start recording when detected on YouTube
-              api.startRecording(300, 2.0)
-                .then(res => {
-                  setIsRecording(true);
-                  setStatus("Recording started! Extracting video data from YouTube...");
-                })
-                .catch(err => {
-                  console.error('Error starting recording:', err);
-                  setStatus("Failed to start recording. Make sure OCR service is running.");
-                });
-            } else if (!isYouTube && isRecording) {
-              // Stop recording when leaving YouTube
-              api.stopRecording()
-                .then(res => {
-                  setIsRecording(false);
-                  setStatus("Recording stopped.");
-                  loadVideos();
-                })
-                .catch(err => {
-                  console.error('Error stopping recording:', err);
-                  setIsRecording(false);
-                });
-            }
-            return isYouTube;
-          }
-          return prev;
-        });
+        setIsOnYouTube(isYouTube);
       } catch (e) {
-        // Cross-origin restrictions might prevent checking parent
-        // In that case, we'll rely on manual triggers
+        // Cross-origin restrictions
       }
     };
 
+    checkYouTube();
     checkIntervalRef.current = setInterval(checkYouTube, 2000);
-    checkYouTube(); // Initial check
 
     return () => {
       if (checkIntervalRef.current) {
         clearInterval(checkIntervalRef.current);
       }
     };
-  }, [isRecording]);
-
-  // Periodic frame capture when recording
-  useEffect(() => {
-    if (isRecording && isOnYouTube) {
-      // Capture a frame every 5 seconds
-      recordingIntervalRef.current = setInterval(() => {
-        api.captureFrame()
-          .then(res => {
-            if (res.data.status === 'success' && res.data.video_data) {
-              console.log('Captured video data:', res.data.video_data);
-              // Refresh videos list
-              api.getVideos()
-                .then(res => {
-                  if (res.data.videos) {
-                    setVideos(res.data.videos);
-                  }
-                })
-                .catch(err => console.error('Error loading videos:', err));
-            }
-          })
-          .catch(err => console.error('Error capturing frame:', err));
-      }, 5000);
-    } else {
-      if (recordingIntervalRef.current) {
-        clearInterval(recordingIntervalRef.current);
-        recordingIntervalRef.current = null;
-      }
-    }
-
-    return () => {
-      if (recordingIntervalRef.current) {
-        clearInterval(recordingIntervalRef.current);
-      }
-    };
-  }, [isRecording, isOnYouTube]);
+  }, []);
 
   // Load videos on mount and periodically
   const loadVideos = () => {
@@ -156,36 +94,101 @@ export default function MainApp() {
     return () => clearInterval(interval);
   }, []);
 
-  const startRecording = () => {
-    api.startRecording(300, 2.0) // Record for 5 minutes, process every 2 seconds
-      .then(res => {
-        setIsRecording(true);
-        const serverMessage = res.data?.message || "Recording started! Extracting video data from YouTube...";
-        setStatus(serverMessage);
-        console.log('Recording started:', res.data);
-      })
-      .catch(err => {
-        console.error('Error starting recording:', err);
-        const errorMessage = err.response?.data?.message || 
-                            err.response?.data?.error || 
-                            err.message || 
-                            "Failed to start recording. Make sure OCR service is running.";
-        setStatus(`Recording error: ${errorMessage}`);
+  const startRecording = async () => {
+    try {
+      // Request screen capture permission
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+        audio: false,
+      } as DisplayMediaStreamOptions);
+
+      mediaStreamRef.current = stream;
+      setIsRecording(true);
+      setStatus("Screen recording started! Capturing frames and sending to OCR...");
+
+      // Create hidden video element to receive stream
+      const video = document.createElement('video');
+      video.srcObject = stream;
+      video.play();
+      screenVideoRef.current = video;
+
+      // Create hidden canvas for frame capture
+      const canvas = document.createElement('canvas');
+      canvas.width = 1920;
+      canvas.height = 1080;
+      screenCanvasRef.current = canvas;
+
+      // Start capturing frames at regular interval
+      captureLoopRef.current = setInterval(async () => {
+        try {
+          if (screenVideoRef.current && screenCanvasRef.current) {
+            const ctx = screenCanvasRef.current.getContext('2d');
+            if (ctx) {
+              // Ensure canvas matches the actual video dimensions for accurate capture
+              const v = screenVideoRef.current as HTMLVideoElement;
+              if (v.videoWidth && v.videoHeight) {
+                screenCanvasRef.current.width = v.videoWidth;
+                screenCanvasRef.current.height = v.videoHeight;
+              }
+              ctx.drawImage(v, 0, 0, screenCanvasRef.current.width, screenCanvasRef.current.height);
+              const imageBase64 = screenCanvasRef.current.toDataURL('image/png');
+              
+              // Send frame to OCR service
+              const response = await api.uploadFrameToOCR(imageBase64);
+              
+              if (response.data.status === 'success' && response.data.video_data) {
+                console.log('OCR extracted:', response.data.video_data);
+                setStatus(`Extracted: ${response.data.video_data.title || 'Processing...'}`);
+                // Refresh videos list
+                loadVideos();
+              }
+            }
+          }
+        } catch (err) {
+          console.error('Error uploading frame to OCR:', err);
+        }
+      }, captureInterval);
+
+      // Handle stream ended (user clicked Stop in the share dialog)
+      stream.getTracks().forEach((track) => {
+        track.onended = () => {
+          stopRecording();
+        };
       });
+    } catch (err: any) {
+      if (err.name === 'NotAllowedError') {
+        setStatus("Screen capture was cancelled. Please try again.");
+      } else {
+        console.error('Error starting screen recording:', err);
+        setStatus(`Error: ${err.message || 'Could not start screen recording'}`);
+      }
+      setIsRecording(false);
+    }
   };
 
   const stopRecording = () => {
-    api.stopRecording()
-      .then(res => {
-        setIsRecording(false);
-        setStatus("Recording stopped.");
-        console.log('Recording stopped:', res.data);
-        loadVideos(); // Refresh videos after stopping
-      })
-      .catch(err => {
-        console.error('Error stopping recording:', err);
-        setIsRecording(false);
-      });
+    // Stop all tracks in the media stream
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+
+    // Clear capture loop
+    if (captureLoopRef.current) {
+      clearInterval(captureLoopRef.current);
+      captureLoopRef.current = null;
+    }
+
+    // Clean up video and canvas
+    if (screenVideoRef.current) {
+      screenVideoRef.current.srcObject = null;
+      screenVideoRef.current = null;
+    }
+    screenCanvasRef.current = null;
+
+    setIsRecording(false);
+    setStatus("Screen recording stopped.");
+    loadVideos();
   };
 
   const handleGoToYouTube = () => {
@@ -208,6 +211,20 @@ export default function MainApp() {
         <p><strong>Status:</strong> {status}</p>
         <p><strong>Recording:</strong> {isRecording ? "🟢 Active" : "🔴 Inactive"}</p>
         <p><strong>On YouTube:</strong> {isOnYouTube ? "✅ Yes" : "❌ No"}</p>
+        <p>
+          <strong>Capture Interval:</strong> {captureInterval}ms
+          <br />
+          <input 
+            type="range" 
+            min="500" 
+            max="5000" 
+            step="500" 
+            value={captureInterval}
+            onChange={(e) => setCaptureInterval(Number(e.target.value))}
+            disabled={isRecording}
+            style={{ width: "200px" }}
+          />
+        </p>
         
         <div style={{ marginTop: "15px", display: "flex", gap: "10px" }}>
           <button 
@@ -222,7 +239,7 @@ export default function MainApp() {
               cursor: isRecording ? "not-allowed" : "pointer"
             }}
           >
-            Start Recording
+            Start Screen Recording
           </button>
           
           <button 

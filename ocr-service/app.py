@@ -11,6 +11,10 @@ import threading
 import time
 from datetime import datetime
 import random
+import base64
+import numpy as np
+import cv2
+from io import BytesIO
 
 load_dotenv()
 
@@ -256,6 +260,50 @@ def capture_frame():
                 'message': 'No video data extracted from frame'
             })
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/upload-frame', methods=['POST'])
+def upload_frame():
+    """Accept an uploaded frame (multipart file) or a base64 image in JSON, run OCR, and save results."""
+    try:
+        # Accept either multipart/form-data file upload with key 'file'
+        # or JSON { "image": "data:image/png;base64,..." }
+        if 'file' in request.files:
+            file_bytes = request.files['file'].read()
+        else:
+            data = request.get_json(force=True, silent=True) or {}
+            img_b64 = data.get('image')
+            if not img_b64:
+                return jsonify({'error': 'No image provided'}), 400
+            # If data URL prefix is included, strip it
+            if img_b64.startswith('data:'):
+                img_b64 = img_b64.split(',', 1)[1]
+            try:
+                file_bytes = base64.b64decode(img_b64)
+            except Exception:
+                return jsonify({'error': 'Invalid base64 image'}), 400
+
+        # Decode image bytes to OpenCV BGR image
+        nparr = np.frombuffer(file_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is None:
+            return jsonify({'error': 'Failed to decode image'}), 400
+
+        # Use existing extractor to get video data
+        video_data = recorder.extractor.extract_video_data(frame)
+
+        if video_data and video_data.get('title'):
+            save_video_data(video_data)
+            return jsonify({'status': 'success', 'video_data': video_data})
+        else:
+            return jsonify({
+                'status': 'no_data',
+                'video_data': video_data,
+                'message': 'No video data extracted from uploaded frame'
+            })
+    except Exception as e:
+        print(f"Upload frame error: {e}")
         return jsonify({'error': str(e)}), 500
 
 

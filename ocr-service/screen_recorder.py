@@ -97,20 +97,44 @@ class YouTubeVideoExtractor:
         Returns:
             Preprocessed grayscale image
         """
+        # Simpler pipeline that previously gave better character recognition
+        height, width = image.shape[:2]
+        # Upscale modestly for small inputs
+        if max(height, width) < 1500:
+            image = cv2.resize(image, (int(width * 1.5), int(height * 1.5)), interpolation=cv2.INTER_CUBIC)
+
         # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Apply thresholding to get binary image
+
+        # Apply Otsu thresholding to separate text from background
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # Apply denoising
+
+        # Apply denoising (fastNlMeans) as earlier version did
         denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
-        
-        # Enhance contrast
+
+        # Enhance contrast using CLAHE
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(denoised)
-        
+
         return enhanced
+
+    def _preprocess_for_ocr_variants(self, image: np.ndarray) -> list:
+        """Return multiple preprocessing variants (normal + inverted) to improve OCR recall."""
+        # Create base preprocessing (as single-channel image)
+        base = self.preprocess_image(image)
+        inv = cv2.bitwise_not(base)
+
+        # Heuristic: detect if image is dark overall (white text on black)
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            mean_brightness = float(np.mean(gray))
+        except Exception:
+            mean_brightness = 255.0
+
+        # If dark background, prefer the inverted preprocessing first
+        if mean_brightness < 120:
+            return [inv, base]
+        return [base, inv]
     
     def extract_text_regions(self, image: np.ndarray) -> List[Dict]:
         """
@@ -122,27 +146,87 @@ class YouTubeVideoExtractor:
         Returns:
             List of text regions with bounding boxes
         """
-        # Get OCR data with bounding boxes
-        ocr_data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-        
-        text_regions = []
-        n_boxes = len(ocr_data['text'])
-        
-        for i in range(n_boxes):
-            text = ocr_data['text'][i].strip()
-            if text and int(ocr_data['conf'][i]) > 30:  # Confidence threshold
+        # Run OCR on multiple preprocessing variants to improve recall
+        text_regions: List[Dict] = []
+        variants = self._preprocess_for_ocr_variants(image)
+        seen_boxes = set()
+
+        # Use single reliable PSM that worked best previously (PSM 6)
+        psm = 6
+        for var in variants:
+            try:
+                config = f'--oem 3 --psm {psm}'
+                ocr_data = pytesseract.image_to_data(var, output_type=pytesseract.Output.DICT, config=config)
+            except Exception as e:
+                print(f"pytesseract error (psm={psm}): {e}")
+                continue
+
+            n_boxes = len(ocr_data.get('text', []))
+            for i in range(n_boxes):
+                text = (ocr_data.get('text', [''])[i] or '').strip()
+                conf_raw = ocr_data.get('conf', [''])[i]
+                try:
+                    conf = float(conf_raw)
+                except Exception:
+                    try:
+                        conf = float(str(conf_raw).strip())
+                    except Exception:
+                        conf = -1.0
+
+                if not text:
+                    continue
+
+                # Restore higher confidence threshold to avoid garbage
+                if conf < 30:
+                    continue
+
+                x = int(ocr_data.get('left', [0])[i])
+                y = int(ocr_data.get('top', [0])[i])
+                w = int(ocr_data.get('width', [0])[i])
+                h = int(ocr_data.get('height', [0])[i])
+
+                key = (x, y, w, h, text)
+                if key in seen_boxes:
+                    continue
+                seen_boxes.add(key)
+
                 text_regions.append({
                     'text': text,
-                    'x': ocr_data['left'][i],
-                    'y': ocr_data['top'][i],
-                    'w': ocr_data['width'][i],
-                    'h': ocr_data['height'][i],
-                    'conf': ocr_data['conf'][i]
+                    'x': x,
+                    'y': y,
+                    'w': w,
+                    'h': h,
+                    'conf': conf
                 })
-        
+
         return text_regions
+
+    def _ocr_region_string(self, image: np.ndarray, region: tuple) -> str:
+        """Crop a region and run tesseract OCR returning the combined text."""
+        x, y, w, h = region
+        h_img, w_img = image.shape[:2]
+        x = max(0, x)
+        y = max(0, y)
+        w = min(w, w_img - x)
+        h = min(h, h_img - y)
+        crop = image[y:y+h, x:x+w]
+        if crop.size == 0:
+            return ''
+
+        # Run on preprocessing variants and combine
+        variants = self._preprocess_for_ocr_variants(crop)
+        texts = []
+        for var in variants:
+            try:
+                txt = pytesseract.image_to_string(var, config='--oem 3 --psm 6')
+                if txt:
+                    texts.append(txt.strip())
+            except Exception:
+                continue
+
+        return '\n'.join(t for t in texts if t)
     
-    def extract_video_title(self, text_regions: List[Dict], image_shape: tuple) -> Optional[str]:
+    def extract_video_title(self, text_regions: List[Dict], image: np.ndarray) -> Optional[str]:
         """
         Extract video title from text regions.
         YouTube titles are typically at the top-center of the page.
@@ -154,38 +238,46 @@ class YouTubeVideoExtractor:
         Returns:
             Extracted video title or None
         """
-        height, width = image_shape[:2]
+        height, width = image.shape[:2]
         
-        # Look for text in the top 30% of the screen, center region
-        top_region_y = int(height * 0.3)
-        center_x_start = int(width * 0.2)
-        center_x_end = int(width * 0.8)
-        
+        # First try combining OCR text regions in top-center area
+        top_region_y = int(height * 0.35)
+        center_x_start = int(width * 0.1)
+        center_x_end = int(width * 0.9)
+
         title_candidates = []
         for region in text_regions:
-            if (region['y'] < top_region_y and 
+            if (region['y'] < top_region_y and
                 center_x_start < region['x'] < center_x_end and
-                len(region['text']) > 5):  # Titles are usually longer
+                len(region['text']) > 3):
                 title_candidates.append(region)
-        
-        # Sort by y-position and confidence
+
         title_candidates.sort(key=lambda x: (x['y'], -x['conf']))
-        
+
         if title_candidates:
-            # Combine nearby text regions that might be part of the title
             title_parts = []
             last_y = -1
-            for candidate in title_candidates[:5]:  # Top 5 candidates
-                if last_y == -1 or abs(candidate['y'] - last_y) < 50:
+            for candidate in title_candidates:
+                if last_y == -1 or abs(candidate['y'] - last_y) < 60:
                     title_parts.append(candidate['text'])
                     last_y = candidate['y']
-            
             if title_parts:
                 return ' '.join(title_parts)
-        
+
+        # Fallback: run OCR on the top area crop (more aggressive)
+        top_crop_h = int(height * 0.25)
+        top_crop = (int(width * 0.05), 0, int(width * 0.9), top_crop_h)
+        top_text = self._ocr_region_string(image, top_crop)
+        if top_text:
+            # Heuristic: choose the longest reasonable line as title
+            lines = [l.strip() for l in top_text.splitlines() if len(l.strip()) > 3]
+            if lines:
+                lines.sort(key=lambda s: -len(s))
+                return lines[0]
+
         return None
     
-    def extract_channel_name(self, text_regions: List[Dict], image_shape: tuple) -> Optional[str]:
+    def extract_channel_name(self, text_regions: List[Dict], image: np.ndarray) -> Optional[str]:
         """
         Extract channel name from text regions.
         Channel names are typically below the title.
@@ -197,31 +289,45 @@ class YouTubeVideoExtractor:
         Returns:
             Extracted channel name or None
         """
-        height, width = image_shape[:2]
+        height, width = image.shape[:2]
         
-        # Look for text below title area (20-40% from top)
-        channel_region_y_start = int(height * 0.2)
-        channel_region_y_end = int(height * 0.4)
-        center_x_start = int(width * 0.2)
-        center_x_end = int(width * 0.8)
-        
+        # Look for text below title area (20-45% from top)
+        channel_region_y_start = int(height * 0.18)
+        channel_region_y_end = int(height * 0.5)
+        center_x_start = int(width * 0.05)
+        center_x_end = int(width * 0.95)
+
         channel_candidates = []
         for region in text_regions:
             if (channel_region_y_start < region['y'] < channel_region_y_end and
                 center_x_start < region['x'] < center_x_end):
-                # Channel names often have "Subscribe" nearby or are shorter
-                if 'Subscribe' in region['text'] or len(region['text']) < 50:
+                # Skip obvious UI labels
+                txt = region['text']
+                if any(k.lower() in txt.lower() for k in ['subscribe', 'views', 'watch']):
                     continue
                 channel_candidates.append(region)
-        
+
         channel_candidates.sort(key=lambda x: (x['y'], -x['conf']))
-        
+
         if channel_candidates:
             return channel_candidates[0]['text']
-        
+
+        # Fallback: try OCR on a region below the title area where channel usually appears
+        channel_crop_y = int(height * 0.18)
+        channel_crop_h = int(height * 0.15)
+        channel_crop = (int(width * 0.05), channel_crop_y, int(width * 0.6), channel_crop_h)
+        ch_text = self._ocr_region_string(image, channel_crop)
+        if ch_text:
+            # pick first non-empty line
+            for line in ch_text.splitlines():
+                line = line.strip()
+                if line and len(line) < 80:
+                    if not any(k.lower() in line.lower() for k in ['subscribe', 'views', 'watch']):
+                        return line
+
         return None
     
-    def extract_view_count(self, text_regions: List[Dict]) -> Optional[str]:
+    def extract_view_count(self, text_regions: List[Dict], image: Optional[np.ndarray] = None) -> Optional[str]:
         """
         Extract view count from text regions.
         
@@ -237,12 +343,25 @@ class YouTubeVideoExtractor:
             r'[\d,\.]+\s*views?',
         ]
         
+        # Search region texts first
         for region in text_regions:
             text = region['text']
             for pattern in view_patterns:
                 match = re.search(pattern, text, re.IGNORECASE)
                 if match:
                     return match.group(0)
+
+        # Fallback: search raw OCR of center-right area where views usually appear
+        if image is not None:
+            h, w = image.shape[:2]
+            crop = (int(w * 0.6), int(h * 0.15), int(w * 0.35), int(h * 0.15))
+            txt = self._ocr_region_string(image, crop)
+            for pattern in view_patterns:
+                m = re.search(pattern, txt or '', re.IGNORECASE)
+                if m:
+                    return m.group(0)
+
+        return None
         
         return None
     
@@ -277,21 +396,27 @@ class YouTubeVideoExtractor:
         Returns:
             Dictionary with extracted video information
         """
-        # Preprocess image
+        # Preprocess image (kept for possible future use) and extract text regions
         processed = self.preprocess_image(image)
-        
-        # Extract text regions
-        text_regions = self.extract_text_regions(processed)
-        
-        # Extract various video information
+
+        # Extract text regions from the original image to avoid double preprocessing
+        # which can convert the image to a single-channel and break color conversions.
+        text_regions = self.extract_text_regions(image)
+
+        # Extract various video information (pass original image for fallbacks)
         video_data = {
-            'title': self.extract_video_title(text_regions, image.shape),
-            'channel': self.extract_channel_name(text_regions, image.shape),
-            'views': self.extract_view_count(text_regions),
+            'title': self.extract_video_title(text_regions, image),
+            'channel': self.extract_channel_name(text_regions, image),
+            'views': self.extract_view_count(text_regions, image),
             'duration': self.extract_video_duration(text_regions),
             'timestamp': datetime.now().isoformat(),
             'raw_text_regions': len(text_regions)
         }
+        # Include text regions (limited) to help debugging and downstream processing
+        try:
+            video_data['text_regions'] = text_regions[:50]
+        except Exception:
+            video_data['text_regions'] = []
         
         return video_data
 
