@@ -294,19 +294,33 @@ def upload_frame():
         video_data = recorder.extractor.extract_video_data(frame)
         print(f"[UPLOAD_FRAME] Extracted video_data: {video_data}")
 
-        if video_data and video_data.get('title'):
-            saved = save_video_data(video_data)
-            print(f"[UPLOAD_FRAME] save_video_data returned: {saved}")
-            if not saved:
-                return jsonify({'status': 'error', 'message': 'Failed to save extracted video data', 'video_data': video_data}), 500
-            return jsonify({'status': 'success', 'video_data': video_data})
-        else:
+        # Support multi-video payloads
+        try:
+            if isinstance(video_data, dict) and video_data.get('multi'):
+                saved_any = 0
+                for v in video_data.get('videos', []):
+                    ok = save_video_data(v)
+                    print(f"[UPLOAD_FRAME] save_video_data returned: {ok} for title={v.get('title')}")
+                    if ok:
+                        saved_any += 1
+                return jsonify({'status': 'success', 'videos_saved': saved_any, 'video_data': video_data})
+
+            if video_data and video_data.get('title'):
+                saved = save_video_data(video_data)
+                print(f"[UPLOAD_FRAME] save_video_data returned: {saved}")
+                if not saved:
+                    return jsonify({'status': 'error', 'message': 'Failed to save extracted video data', 'video_data': video_data}), 500
+                return jsonify({'status': 'success', 'video_data': video_data})
+
             print(f"[UPLOAD_FRAME] No title found in extracted data. video_data keys: {list(video_data.keys()) if isinstance(video_data, dict) else 'N/A'}")
             return jsonify({
                 'status': 'no_data',
                 'video_data': video_data,
                 'message': 'No video data extracted from uploaded frame'
             })
+        except Exception as e:
+            print(f"[UPLOAD_FRAME] Error saving data: {e}")
+            return jsonify({'error': str(e)}), 500
     except Exception as e:
         print(f"Upload frame error: {e}")
         return jsonify({'error': str(e)}), 500

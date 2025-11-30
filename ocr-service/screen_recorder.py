@@ -819,31 +819,145 @@ class YouTubeVideoExtractor:
 
         processed = self.preprocess_image(cropped_image)
         text_regions = self.extract_text_regions(cropped_image)
-        
+
         print(f"[DEBUG] Extracted {len(text_regions)} text regions")
         if text_regions:
             print(f"[DEBUG] First regions: {[(r['text'][:30], r['conf']) for r in text_regions[:5]]}")
 
-        video_data = {
-            'title': self.extract_video_title(text_regions, cropped_image),
-            'channel': self.extract_channel_name(text_regions, cropped_image),
-            'views': self.extract_view_count(text_regions, cropped_image),
-            'duration': self.extract_video_duration(text_regions),
-            'timestamp': datetime.now().isoformat(),
-            'raw_text_regions': len(text_regions)
-        }
-        try:
-            video_data['text_regions'] = text_regions[:50]
-        except Exception:
-            video_data['text_regions'] = []
-        
-        print(f"[DEBUG] Final: title={video_data['title']}, channel={video_data['channel']}")
-        
-        # Step 5: Apply temporal aggregation if enabled
-        if enable_temporal_aggregation:
-            video_data = self._aggregate_frame_results(video_data)
-        
-        return video_data
+        # Detect candidate text block regions (likely video cards)
+        blocks = self._find_text_block_regions(cropped_image)
+        print(f"[DEBUG] Detected {len(blocks)} text blocks")
+
+        videos = []
+
+        if blocks:
+            # For each detected block, collect lines that intersect the block and extract fields
+            for (bx, by, bw, bh) in blocks:
+                # select regions that overlap block
+                block_lines = []
+                for r in text_regions:
+                    rx, ry, rw, rh = r['x'], r['y'], r['w'], r['h']
+                    # compute intersection
+                    inter_x1 = max(bx, rx)
+                    inter_y1 = max(by, ry)
+                    inter_x2 = min(bx + bw, rx + rw)
+                    inter_y2 = min(by + bh, ry + rh)
+                    if inter_x2 > inter_x1 and inter_y2 > inter_y1:
+                        block_lines.append(r)
+
+                if not block_lines:
+                    continue
+
+                title = self.extract_video_title(block_lines, cropped_image)
+                channel = self.extract_channel_name(block_lines, cropped_image)
+                views = self.extract_view_count(block_lines, cropped_image)
+                duration = self.extract_video_duration(block_lines)
+
+                # If the OCR produced multiple titles concatenated with patterns like ': 3',
+                # split them into separate video entries. Common OCR artifact is ': 3' between titles.
+                if title and re.search(r"\:\s*3\b", title):
+                    parts = [p.strip() for p in re.split(r"\:\s*3\b", title) if p.strip()]
+                    for p in parts:
+                        if not self._filter_text_by_heuristics(p, strict=False):
+                            continue
+                        v = {
+                            'title': p,
+                            'channel': channel,
+                            'views': views,
+                            'duration': duration,
+                            'timestamp': datetime.now().isoformat(),
+                            'raw_text_regions': len(block_lines),
+                            'text_regions': block_lines,
+                            'block_bbox': (bx, by, bw, bh)
+                        }
+                        videos.append(v)
+                else:
+                    video_data = {
+                        'title': title,
+                        'channel': channel,
+                        'views': views,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'raw_text_regions': len(block_lines),
+                        'text_regions': block_lines,
+                        'block_bbox': (bx, by, bw, bh)
+                    }
+
+                    videos.append(video_data)
+
+        # If no blocks detected, fall back to previous single-video extraction
+        if not videos:
+            title = self.extract_video_title(text_regions, cropped_image)
+            channel = self.extract_channel_name(text_regions, cropped_image)
+            views = self.extract_view_count(text_regions, cropped_image)
+            duration = self.extract_video_duration(text_regions)
+
+            if title and re.search(r":\s*\d+\b", title):
+                # Split on patterns like ': 3' or ':3' into multiple titles
+                parts = [p.strip() for p in re.split(r":\s*\d+\b", title) if p.strip()]
+                videos = []
+                for p in parts:
+                    p_clean = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", p).strip()
+                    if not p_clean:
+                        continue
+                    if not self._filter_text_by_heuristics(p_clean, strict=False):
+                        continue
+                    v = {
+                        'title': p_clean,
+                        'channel': channel,
+                        'views': views,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'raw_text_regions': len(text_regions),
+                        'text_regions': text_regions[:50]
+                    }
+                    videos.append(v)
+
+                if videos:
+                    result = {'multi': True, 'videos': videos, 'timestamp': datetime.now().isoformat()}
+                    print(f"[DEBUG] Fallback split into {len(videos)} videos")
+                    return result
+
+            # No splitting, return single
+            video_data = {
+                'title': title,
+                'channel': channel,
+                'views': views,
+                'duration': duration,
+                'timestamp': datetime.now().isoformat(),
+                'raw_text_regions': len(text_regions),
+                'text_regions': text_regions[:50]
+            }
+            print(f"[DEBUG] Final: title={video_data['title']}, channel={video_data['channel']}")
+            if enable_temporal_aggregation:
+                return self._aggregate_frame_results(video_data)
+            return video_data
+
+        # Deduplicate/clean videos and return list if multiple
+        # Post-process titles: normalize and remove empty
+        cleaned = []
+        seen_titles = set()
+        for v in videos:
+            t = (v.get('title') or '').strip()
+            if not t:
+                continue
+            # remove duplicates by normalized lowercase title
+            norm = re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9 ]', '', t)).strip().lower()
+            if not norm or norm in seen_titles:
+                continue
+            seen_titles.add(norm)
+            cleaned.append(v)
+
+        if len(cleaned) == 1:
+            # return single dict for compatibility
+            if enable_temporal_aggregation:
+                return self._aggregate_frame_results(cleaned[0])
+            return cleaned[0]
+
+        # Return multi-video payload
+        result = {'multi': True, 'videos': cleaned, 'timestamp': datetime.now().isoformat()}
+        print(f"[DEBUG] Returning {len(cleaned)} video entries from page")
+        return result
 
 
 class YouTubeScreenRecorder:
@@ -883,9 +997,16 @@ class YouTubeScreenRecorder:
                 if frame is not None:
                     try:
                         video_data = self.extractor.extract_video_data(frame)
-                        if video_data['title']:  # Only save if we found a title
-                            self.video_data_history.append(video_data)
-                            print(f"Extracted: {video_data.get('title', 'N/A')}")
+                        # Support multi-video results
+                        if isinstance(video_data, dict) and video_data.get('multi'):
+                            for v in video_data.get('videos', []):
+                                if v.get('title'):
+                                    self.video_data_history.append(v)
+                                    print(f"Extracted: {v.get('title', 'N/A')}")
+                        else:
+                            if video_data and video_data.get('title'):
+                                self.video_data_history.append(video_data)
+                                print(f"Extracted: {video_data.get('title', 'N/A')}")
                     except Exception as e:
                         print(f"Error processing frame: {e}")
                 
