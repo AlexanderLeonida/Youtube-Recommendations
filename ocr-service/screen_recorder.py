@@ -10,6 +10,9 @@ import json
 from typing import List, Dict, Optional
 from datetime import datetime
 import re
+from collections import Counter
+import os
+import tempfile
 
 
 class ScreenRecorder:
@@ -85,7 +88,26 @@ class YouTubeVideoExtractor:
         # Configure Tesseract (adjust path if needed)
         # For Linux/Docker, tesseract should be in PATH
         # For macOS, might need: pytesseract.pytesseract.tesseract_cmd = '/usr/local/bin/tesseract'
-        pass
+        # Stopwords to filter out (common UI labels, menu items, etc.)
+        self.stopwords = {
+            'search', 'create', 'upload', 'extensions', 'settings', 'history',
+            'watch', 'subscribe', 'views', 'tab', 'home', 'explore', 'subscriptions',
+            'library', 'your', 'channel', 'youtube', 'short', 'downloads', 'show more',
+            'like', 'share', 'save', 'report', 'add', 'menu', 'sort', 'filter',
+            'play', 'pause', 'fullscreen', 'settings', 'cc', 'audio', 'quality'
+        }
+        # Frame history for temporal aggregation
+        self.frame_history = []
+        self.max_history_frames = 5
+
+        # Tunable parameters
+        self.ocr_conf_threshold = 45.0  # minimum per-word confidence to consider
+        self.line_conf_threshold = 40.0  # minimum line-level confidence
+        self.top_k_regions = 12
+        # Debugging: save annotated images for inspection when True
+        self.debug_output = True if os.getenv('OCR_DEBUG', 'false').lower() == 'true' else False
+        # Debug save directory
+        self.debug_dir = '/tmp'
     
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """
@@ -136,34 +158,78 @@ class YouTubeVideoExtractor:
             return [inv, base]
         return [base, inv]
     
+    def _find_text_block_regions(self, image: np.ndarray) -> List[tuple]:
+        """
+        Detect candidate text block regions using simple contour detection.
+        Step 2: Detect video-card regions before OCR.
+        
+        Args:
+            image: Input image (BGR)
+            
+        Returns:
+            List of regions (x, y, w, h) to prioritize for OCR
+        """
+        try:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            # Detect text blocks using morphological operations
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (10, 5))
+            dilated = cv2.dilate(gray, kernel, iterations=2)
+            
+            # Find contours
+            contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            regions = []
+            h, w = image.shape[:2]
+            
+            for contour in contours:
+                x, y, cw, ch = cv2.boundingRect(contour)
+                # Filter by size: text blocks should be reasonable size (not tiny, not entire image)
+                if 30 < cw < w * 0.9 and 15 < ch < h * 0.3:
+                    regions.append((x, y, cw, ch))
+            
+            return sorted(regions, key=lambda r: r[1])  # Sort by y position (top to bottom)
+        except Exception as e:
+            print(f"Error detecting text blocks: {e}")
+            return []
+    
     def extract_text_regions(self, image: np.ndarray) -> List[Dict]:
         """
         Extract text regions from image using OCR.
+        Step 3: Filter by confidence and bounding box geometry.
         
         Args:
-            image: Preprocessed image
+            image: Input image
             
         Returns:
-            List of text regions with bounding boxes
+            List of text regions with bounding boxes (filtered)
         """
-        # Run OCR on multiple preprocessing variants to improve recall
-        text_regions: List[Dict] = []
-        variants = self._preprocess_for_ocr_variants(image)
-        seen_boxes = set()
+        # Multi-scale OCR -> collect word boxes then merge into line-level regions
+        h_img, w_img = image.shape[:2]
+        scales = [1.0, 1.5]
+        words = []
 
-        # Use single reliable PSM that worked best previously (PSM 6)
-        psm = 6
-        for var in variants:
+        for scale in scales:
             try:
-                config = f'--oem 3 --psm {psm}'
-                ocr_data = pytesseract.image_to_data(var, output_type=pytesseract.Output.DICT, config=config)
+                if scale != 1.0:
+                    img = cv2.resize(image, (int(w_img * scale), int(h_img * scale)), interpolation=cv2.INTER_CUBIC)
+                else:
+                    img = image.copy()
+
+                proc = self.preprocess_image(img)
+                config = '--oem 3 --psm 6'
+                ocr_data = pytesseract.image_to_data(proc, output_type=pytesseract.Output.DICT, config=config)
             except Exception as e:
-                print(f"pytesseract error (psm={psm}): {e}")
+                print(f"pytesseract error (scale={scale}): {e}")
                 continue
 
-            n_boxes = len(ocr_data.get('text', []))
-            for i in range(n_boxes):
-                text = (ocr_data.get('text', [''])[i] or '').strip()
+            n = len(ocr_data.get('text', []))
+            print(f"[DEBUG] OCR scale={scale} found {n} boxes")
+
+            for i in range(n):
+                txt = (ocr_data.get('text', [''])[i] or '').strip()
+                if not txt:
+                    continue
+
                 conf_raw = ocr_data.get('conf', [''])[i]
                 try:
                     conf = float(conf_raw)
@@ -173,34 +239,209 @@ class YouTubeVideoExtractor:
                     except Exception:
                         conf = -1.0
 
-                if not text:
+                if conf < self.ocr_conf_threshold:
                     continue
 
-                # Restore higher confidence threshold to avoid garbage
-                if conf < 30:
+                left = int(ocr_data.get('left', [0])[i])
+                top = int(ocr_data.get('top', [0])[i])
+                width = int(ocr_data.get('width', [0])[i])
+                height = int(ocr_data.get('height', [0])[i])
+
+                # Map coordinates back to original image space
+                if scale != 1.0:
+                    left = int(left / scale)
+                    top = int(top / scale)
+                    width = int(width / scale)
+                    height = int(height / scale)
+
+                # Filter by geometry
+                if width < 6 or height < 6 or width > w_img * 0.95 or height > h_img * 0.5:
                     continue
 
-                x = int(ocr_data.get('left', [0])[i])
-                y = int(ocr_data.get('top', [0])[i])
-                w = int(ocr_data.get('width', [0])[i])
-                h = int(ocr_data.get('height', [0])[i])
-
-                key = (x, y, w, h, text)
-                if key in seen_boxes:
-                    continue
-                seen_boxes.add(key)
-
-                text_regions.append({
-                    'text': text,
-                    'x': x,
-                    'y': y,
-                    'w': w,
-                    'h': h,
-                    'conf': conf
+                area = width * height
+                words.append({
+                    'text': txt,
+                    'x': left,
+                    'y': top,
+                    'w': width,
+                    'h': height,
+                    'conf': conf,
+                    'area': area
                 })
+
+        if not words:
+            return []
+
+        # Group words into lines by vertical proximity
+        words = sorted(words, key=lambda r: r['y'])
+        lines = []
+        cur_line = [words[0]]
+        cur_y = words[0]['y']
+
+        for w in words[1:]:
+            # threshold relative to word height
+            thresh = max(20, int((w['h'] + cur_line[-1]['h']) / 2))
+            if abs(w['y'] - cur_y) <= thresh:
+                cur_line.append(w)
+                # update cur_y as average
+                cur_y = int(sum(item['y'] for item in cur_line) / len(cur_line))
+            else:
+                lines.append(cur_line)
+                cur_line = [w]
+                cur_y = w['y']
+        if cur_line:
+            lines.append(cur_line)
+
+        # Build line regions
+        text_regions = []
+        for line in lines:
+            line_sorted = sorted(line, key=lambda r: r['x'])
+            line_text = ' '.join([r['text'] for r in line_sorted])
+            x_min = min(r['x'] for r in line_sorted)
+            y_min = min(r['y'] for r in line_sorted)
+            x_max = max(r['x'] + r['w'] for r in line_sorted)
+            y_max = max(r['y'] + r['h'] for r in line_sorted)
+            w_box = x_max - x_min
+            h_box = y_max - y_min
+            total_area = sum(r['area'] for r in line_sorted)
+            # weighted confidence by area
+            if total_area > 0:
+                weighted_conf = sum(r['conf'] * r['area'] for r in line_sorted) / total_area
+            else:
+                weighted_conf = float(sum(r['conf'] for r in line_sorted) / len(line_sorted))
+
+            region = {
+                'text': line_text,
+                'x': int(x_min),
+                'y': int(y_min),
+                'w': int(w_box),
+                'h': int(h_box),
+                'conf': float(weighted_conf),
+                'area': int(w_box * h_box)
+            }
+
+            # Basic filtering: reasonable length and confidence
+            if len(line_text) >= 2 and (region['conf'] >= self.line_conf_threshold or len(line_text) > 8):
+                text_regions.append(region)
+
+        # Sort top-to-bottom
+        text_regions = sorted(text_regions, key=lambda r: r['y'])
+
+        # Optionally save debug annotated image
+        if self.debug_output:
+            try:
+                self._draw_debug_image(image, text_regions)
+            except Exception as e:
+                print(f"[DEBUG] Failed to write debug image: {e}")
+
+        print(f"[DEBUG] extract_text_regions produced {len(text_regions)} line regions")
+        if text_regions:
+            for reg in text_regions[:8]:
+                print(f"[DEBUG] Line region: '{reg['text'][:40]}' conf={reg['conf']:.1f} bbox=({reg['x']},{reg['y']},{reg['w']},{reg['h']})")
 
         return text_regions
 
+    def _filter_text_by_heuristics(self, text: str, strict: bool = False) -> bool:
+        """
+        Step 4: Post-filter OCR text with regex + heuristics.
+        Check if text is plausible for video title/channel.
+        
+        Args:
+            text: Text to validate
+            strict: If True, apply stricter filtering. If False, be more lenient.
+            
+        Returns:
+            True if text passes heuristics, False otherwise
+        """
+        if not text or len(text) < 2:
+            return False
+        
+        # Remove leading/trailing whitespace
+        text = text.strip()
+        
+        # Filter out pure numbers and tiny text
+        if len(text) < 2 or len(text) > 250:
+            return False
+        
+        # Filter out pure emoji or special characters
+        if not any(c.isalnum() for c in text):
+            return False
+        
+        # ONLY block EXACT stopword matches in strict mode
+        if strict:
+            if text.lower() in self.stopwords:
+                return False
+        
+        # Filter out view-count patterns (contains only numbers and units)
+        if re.match(r'^[\d,\.]+\s*[KMBkb]?$', text):
+            return False
+        
+        # Filter out common UI-only labels in strict mode
+        if strict:
+            ui_only_words = {'search', 'create', 'upload', 'subscribe', 'home', 'explore', 'library'}
+            if text.lower() in ui_only_words:
+                return False
+        
+        return True
+    
+    def _aggregate_frame_results(self, video_data: Dict) -> Dict:
+        """
+        Step 5: Temporal aggregation - aggregate OCR results across multiple frames.
+        Take the most frequent/highest-confidence result for the same field.
+        
+        Args:
+            video_data: Current frame's video data
+            
+        Returns:
+            Aggregated video data from frame history
+        """
+        self.frame_history.append(video_data)
+        if len(self.frame_history) > self.max_history_frames:
+            self.frame_history.pop(0)
+        
+        # Only aggregate if we have multiple frames
+        if len(self.frame_history) < 2:
+            return video_data
+        
+        aggregated = {
+            'title': self._aggregate_field('title'),
+            'channel': self._aggregate_field('channel'),
+            'views': self._aggregate_field('views'),
+            'duration': self._aggregate_field('duration'),
+        }
+        
+        # Keep current timestamp and raw count
+        aggregated['timestamp'] = video_data['timestamp']
+        aggregated['raw_text_regions'] = video_data.get('raw_text_regions', 0)
+        aggregated['text_regions'] = video_data.get('text_regions', [])
+        
+        return aggregated
+    
+    def _aggregate_field(self, field: str) -> Optional[str]:
+        """
+        Get the most frequent value for a field across frame history,
+        or the highest confidence if field appears in only one frame.
+        
+        Args:
+            field: Field name ('title', 'channel', 'views', 'duration')
+            
+        Returns:
+            Most frequent/highest-confidence value or None
+        """
+        values = [f.get(field) for f in self.frame_history if f.get(field)]
+        
+        if not values:
+            return None
+        
+        # Return most frequent value
+        counter = Counter(values)
+        most_common, _ = counter.most_common(1)[0]
+        return most_common
+    
+    def clear_frame_history(self):
+        """Clear temporal frame history."""
+        self.frame_history = []
+    
     def _ocr_region_string(self, image: np.ndarray, region: tuple) -> str:
         """Crop a region and run tesseract OCR returning the combined text."""
         x, y, w, h = region
@@ -225,11 +466,39 @@ class YouTubeVideoExtractor:
                 continue
 
         return '\n'.join(t for t in texts if t)
+
+    def _normalize_line_text(self, text: str) -> str:
+        """
+        Normalize a line by collapsing adjacent duplicate words and trimming extra whitespace.
+        Keeps original casing for output but uses a normalized token for duplicate detection.
+        """
+        if not text:
+            return text
+        # Split on whitespace, keep punctuation attached for output but normalize for comparison
+        tokens = re.split(r'\s+', text.strip())
+        out_tokens = []
+        prev_norm = None
+        for t in tokens:
+            # Normalize token for comparison: strip punctuation and lowercase
+            norm = re.sub(r'[^A-Za-z0-9]', '', t).lower()
+            if norm == '':
+                # Keep punctuation-only tokens only if not duplicate
+                if prev_norm != t:
+                    out_tokens.append(t)
+                    prev_norm = t
+                continue
+            if norm == prev_norm:
+                continue
+            out_tokens.append(t)
+            prev_norm = norm
+
+        return ' '.join(out_tokens)
     
     def extract_video_title(self, text_regions: List[Dict], image: np.ndarray) -> Optional[str]:
         """
         Extract video title from text regions.
         YouTube titles are typically at the top-center of the page.
+        Step 4: Apply heuristic filtering to rejected unwanted text.
         
         Args:
             text_regions: List of extracted text regions
@@ -239,7 +508,65 @@ class YouTubeVideoExtractor:
             Extracted video title or None
         """
         height, width = image.shape[:2]
-        
+        # Normalize text regions (collapse duplicated adjacent tokens)
+        for r in text_regions:
+            r['text'] = self._normalize_line_text(r.get('text', ''))
+
+        # Score candidate lines and pick best by area*conf * content score * position weight
+        height, width = image.shape[:2]
+        candidates = []
+        for r in text_regions:
+            txt = r.get('text', '').strip()
+            if not txt:
+                continue
+            area = r.get('area', r.get('w', 0) * r.get('h', 0)) or 1
+            conf = float(r.get('conf', 0) or 0)
+
+            # Content heuristics
+            words = re.findall(r"\w+", txt)
+            word_count = len(words)
+            avg_word_len = (sum(len(w) for w in words) / word_count) if word_count else 0
+            alpha_chars = sum(ch.isalnum() for ch in txt)
+            frac_alnum = alpha_chars / max(1, len(txt))
+
+            # Penalize lines with lots of punctuation/noise
+            noise_penalty = 1.0
+            non_alnum_frac = 1.0 - frac_alnum
+            if non_alnum_frac > 0.25:
+                noise_penalty = 0.6
+            if non_alnum_frac > 0.5:
+                noise_penalty = 0.2
+
+            # Boost for reasonable sentence-like content
+            content_score = 1.0
+            if word_count >= 4 and avg_word_len >= 3:
+                content_score = 1.6
+            elif word_count >= 2 and avg_word_len >= 3:
+                content_score = 1.2
+
+            # Position weight: titles often appear near the upper-middle of the content area
+            y = r.get('y', 0)
+            pos_weight = 1.0
+            rel_y = y / max(1, height)
+            if 0.15 <= rel_y <= 0.6:
+                pos_weight = 1.3
+            if 0.25 <= rel_y <= 0.5:
+                pos_weight = 1.6
+
+            score = area * conf * content_score * pos_weight * noise_penalty
+            candidates.append((score, r))
+
+        if candidates:
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            best_score, best_region = candidates[0]
+            best_text = best_region.get('text', '')
+            # Final filter check
+            if self._filter_text_by_heuristics(best_text, strict=False):
+                print(f"[DEBUG] Title selected by scoring: '{best_text}' score={best_score:.1f}")
+                return best_text
+            else:
+                print(f"[DEBUG] Best candidate filtered out by heuristics: '{best_text}' score={best_score:.1f}")
+
         # First try combining OCR text regions in top-center area
         top_region_y = int(height * 0.35)
         center_x_start = int(width * 0.1)
@@ -247,22 +574,41 @@ class YouTubeVideoExtractor:
 
         title_candidates = []
         for region in text_regions:
+            # Be more lenient with individual words - don't filter here
             if (region['y'] < top_region_y and
                 center_x_start < region['x'] < center_x_end and
-                len(region['text']) > 3):
+                len(region['text']) > 1):  # Allow single words
                 title_candidates.append(region)
 
-        title_candidates.sort(key=lambda x: (x['y'], -x['conf']))
+        title_candidates.sort(key=lambda x: (x['y'], x['x']))  # Sort top-to-bottom, left-to-right
 
         if title_candidates:
+            # Combine nearby words into title
             title_parts = []
             last_y = -1
             for candidate in title_candidates:
-                if last_y == -1 or abs(candidate['y'] - last_y) < 60:
+                # Check if this word is on the same line (within 30 pixels vertically)
+                if last_y == -1 or abs(candidate['y'] - last_y) < 30:
                     title_parts.append(candidate['text'])
                     last_y = candidate['y']
+                else:
+                    # Different line - stop here
+                    break
+            
             if title_parts:
-                return ' '.join(title_parts)
+                combined_title = ' '.join(title_parts)
+                # Apply heuristic filtering to the FINAL combined title
+                if self._filter_text_by_heuristics(combined_title, strict=True):
+                    print(f"[DEBUG] Title from regions: '{combined_title}' (accepted, strict=True)")
+                    return combined_title
+                else:
+                    print(f"[DEBUG] Combined title filtered out by strict rules: '{combined_title}'")
+                    # Try a more lenient filter before giving up
+                    if self._filter_text_by_heuristics(combined_title, strict=False):
+                        print(f"[DEBUG] Title from regions accepted with lenient filter: '{combined_title}'")
+                        return combined_title
+                    else:
+                        print(f"[DEBUG] Combined title rejected by lenient filter too: '{combined_title}'")
 
         # Fallback: run OCR on the top area crop (more aggressive)
         top_crop_h = int(height * 0.25)
@@ -273,7 +619,14 @@ class YouTubeVideoExtractor:
             lines = [l.strip() for l in top_text.splitlines() if len(l.strip()) > 3]
             if lines:
                 lines.sort(key=lambda s: -len(s))
-                return lines[0]
+                candidate_title = lines[0]
+                passed = self._filter_text_by_heuristics(candidate_title, strict=False)
+                print(f"[DEBUG] Fallback candidate: '{candidate_title}' passed_filter={passed}")
+                if passed:
+                    print(f"[DEBUG] Title from fallback: '{candidate_title}'")
+                    return candidate_title
+                else:
+                    print(f"[DEBUG] Fallback title filtered: '{candidate_title}'")
 
         return None
     
@@ -281,6 +634,7 @@ class YouTubeVideoExtractor:
         """
         Extract channel name from text regions.
         Channel names are typically below the title.
+        Step 4: Apply heuristic filtering.
         
         Args:
             text_regions: List of extracted text regions
@@ -291,9 +645,9 @@ class YouTubeVideoExtractor:
         """
         height, width = image.shape[:2]
         
-        # Look for text below title area (20-45% from top)
-        channel_region_y_start = int(height * 0.18)
-        channel_region_y_end = int(height * 0.5)
+        # Look for text below title area (15-40% from top)
+        channel_region_y_start = int(height * 0.15)
+        channel_region_y_end = int(height * 0.45)
         center_x_start = int(width * 0.05)
         center_x_end = int(width * 0.95)
 
@@ -301,19 +655,23 @@ class YouTubeVideoExtractor:
         for region in text_regions:
             if (channel_region_y_start < region['y'] < channel_region_y_end and
                 center_x_start < region['x'] < center_x_end):
-                # Skip obvious UI labels
+                # Don't filter individual words - combine first, filter later
                 txt = region['text']
-                if any(k.lower() in txt.lower() for k in ['subscribe', 'views', 'watch']):
-                    continue
                 channel_candidates.append(region)
 
-        channel_candidates.sort(key=lambda x: (x['y'], -x['conf']))
+        channel_candidates.sort(key=lambda x: (x['y'], x['x']))  # Sort top-to-bottom, left-to-right
 
         if channel_candidates:
-            return channel_candidates[0]['text']
+            # Try to get the first likely channel name (usually short and on one line)
+            for candidate in channel_candidates:
+                txt = candidate['text']
+                # Apply filter to individual candidates
+                if self._filter_text_by_heuristics(txt, strict=False) and len(txt) < 80:
+                    print(f"[DEBUG] Channel from regions: '{txt}'")
+                    return txt
 
         # Fallback: try OCR on a region below the title area where channel usually appears
-        channel_crop_y = int(height * 0.18)
+        channel_crop_y = int(height * 0.15)
         channel_crop_h = int(height * 0.15)
         channel_crop = (int(width * 0.05), channel_crop_y, int(width * 0.6), channel_crop_h)
         ch_text = self._ocr_region_string(image, channel_crop)
@@ -321,11 +679,63 @@ class YouTubeVideoExtractor:
             # pick first non-empty line
             for line in ch_text.splitlines():
                 line = line.strip()
-                if line and len(line) < 80:
-                    if not any(k.lower() in line.lower() for k in ['subscribe', 'views', 'watch']):
-                        return line
+                if line and len(line) < 80 and self._filter_text_by_heuristics(line, strict=False):
+                    print(f"[DEBUG] Channel from fallback: '{line}'")
+                    return line
+            if ch_text.strip():
+                print(f"[DEBUG] Channel fallback found text but filtered: {ch_text.splitlines()[:2]}")
 
         return None
+
+    def get_largest_text_regions(self, text_regions: List[Dict], top_k: int = 12, by: str = 'area') -> List[Dict]:
+        """
+        Return the largest text regions by area or height.
+
+        Args:
+            text_regions: List of OCR text region dicts
+            top_k: Number of top regions to return
+            by: Metric to rank by: 'area' or 'height'
+
+        Returns:
+            List of top-k regions sorted by the chosen metric (descending)
+        """
+        if not text_regions:
+            return []
+
+        def metric(r):
+            # Score lines by area * confidence to prefer large, high-confidence lines
+            area = r.get('area', r.get('w', 0) * r.get('h', 0))
+            conf = float(r.get('conf', 0) or 0)
+            if by == 'height':
+                return r.get('h', 0) * conf
+            return area * conf
+
+        sorted_regions = sorted(text_regions, key=lambda r: metric(r), reverse=True)
+        return sorted_regions[:top_k]
+
+    def _draw_debug_image(self, image: np.ndarray, text_regions: List[Dict], top_n: int = 12) -> None:
+        """
+        Draw bounding boxes and candidate labels onto a copy of the image and save to disk.
+        """
+        try:
+            vis = image.copy()
+            h, w = vis.shape[:2]
+            # Choose top regions to draw
+            regions = self.get_largest_text_regions(text_regions, top_k=top_n)
+            for i, r in enumerate(regions):
+                x, y, ww, hh = r['x'], r['y'], r['w'], r['h']
+                color = (0, 200, 0) if i == 0 else (0, 120, 255)
+                cv2.rectangle(vis, (x, y), (x + ww, y + hh), color, 2)
+                label = f"{i+1}:{r['text'][:30]} ({r.get('conf',0):.0f})"
+                cv2.putText(vis, label, (x, max(10, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
+
+            # Save to temp file
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            fname = os.path.join(self.debug_dir, f"ocr_debug_{ts}.png")
+            cv2.imwrite(fname, vis)
+            print(f"[DEBUG] Wrote annotated OCR debug image: {fname}")
+        except Exception as e:
+            print(f"[DEBUG] Error drawing debug image: {e}")
     
     def extract_view_count(self, text_regions: List[Dict], image: Optional[np.ndarray] = None) -> Optional[str]:
         """
@@ -386,37 +796,52 @@ class YouTubeVideoExtractor:
         
         return None
     
-    def extract_video_data(self, image: np.ndarray) -> Dict:
+    def extract_video_data(self, image: np.ndarray, enable_temporal_aggregation: bool = True) -> Dict:
         """
         Extract all video data from a YouTube screenshot.
+        Step 1: Crop out browser chrome (ignore top N pixels).
+        Step 5: Support temporal aggregation across frames.
         
         Args:
             image: Screenshot image (BGR format)
+            enable_temporal_aggregation: If True, aggregate results across frames
             
         Returns:
             Dictionary with extracted video information
         """
-        # Preprocess image (kept for possible future use) and extract text regions
-        processed = self.preprocess_image(image)
+        # Step 1: Ignore top N pixels (browser chrome)
+        N = 120  # pixels to ignore at top (reduced from 1000 for better detection)
+        height, width = image.shape[:2]
+        if height > N:
+            cropped_image = image[N:, :]
+        else:
+            cropped_image = image
 
-        # Extract text regions from the original image to avoid double preprocessing
-        # which can convert the image to a single-channel and break color conversions.
-        text_regions = self.extract_text_regions(image)
+        processed = self.preprocess_image(cropped_image)
+        text_regions = self.extract_text_regions(cropped_image)
+        
+        print(f"[DEBUG] Extracted {len(text_regions)} text regions")
+        if text_regions:
+            print(f"[DEBUG] First regions: {[(r['text'][:30], r['conf']) for r in text_regions[:5]]}")
 
-        # Extract various video information (pass original image for fallbacks)
         video_data = {
-            'title': self.extract_video_title(text_regions, image),
-            'channel': self.extract_channel_name(text_regions, image),
-            'views': self.extract_view_count(text_regions, image),
+            'title': self.extract_video_title(text_regions, cropped_image),
+            'channel': self.extract_channel_name(text_regions, cropped_image),
+            'views': self.extract_view_count(text_regions, cropped_image),
             'duration': self.extract_video_duration(text_regions),
             'timestamp': datetime.now().isoformat(),
             'raw_text_regions': len(text_regions)
         }
-        # Include text regions (limited) to help debugging and downstream processing
         try:
             video_data['text_regions'] = text_regions[:50]
         except Exception:
             video_data['text_regions'] = []
+        
+        print(f"[DEBUG] Final: title={video_data['title']}, channel={video_data['channel']}")
+        
+        # Step 5: Apply temporal aggregation if enabled
+        if enable_temporal_aggregation:
+            video_data = self._aggregate_frame_results(video_data)
         
         return video_data
 

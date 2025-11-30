@@ -292,11 +292,16 @@ def upload_frame():
 
         # Use existing extractor to get video data
         video_data = recorder.extractor.extract_video_data(frame)
+        print(f"[UPLOAD_FRAME] Extracted video_data: {video_data}")
 
         if video_data and video_data.get('title'):
-            save_video_data(video_data)
+            saved = save_video_data(video_data)
+            print(f"[UPLOAD_FRAME] save_video_data returned: {saved}")
+            if not saved:
+                return jsonify({'status': 'error', 'message': 'Failed to save extracted video data', 'video_data': video_data}), 500
             return jsonify({'status': 'success', 'video_data': video_data})
         else:
+            print(f"[UPLOAD_FRAME] No title found in extracted data. video_data keys: {list(video_data.keys()) if isinstance(video_data, dict) else 'N/A'}")
             return jsonify({
                 'status': 'no_data',
                 'video_data': video_data,
