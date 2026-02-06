@@ -1,0 +1,126 @@
+# TwinTube Vector - Kubernetes Services
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-ml
+  namespace: twintube
+  labels:
+    app: twintube
+    component: ml-service
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: twintube
+    component: ml-service
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-backend
+  namespace: twintube
+  labels:
+    app: twintube
+    component: backend
+spec:
+  type: ClusterIP
+  ports:
+  - port: 4000
+    targetPort: 4000
+    protocol: TCP
+    name: http
+  selector:
+    app: twintube
+    component: backend
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-frontend
+  namespace: twintube
+  labels:
+    app: twintube
+    component: frontend
+spec:
+  type: ClusterIP
+  ports:
+  - port: 3000
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  selector:
+    app: twintube
+    component: frontend
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-ocr
+  namespace: twintube
+  labels:
+    app: twintube
+    component: ocr-service
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5000
+    targetPort: 5000
+    protocol: TCP
+    name: http
+  selector:
+    app: twintube
+    component: ocr-service
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-redis
+  namespace: twintube
+  labels:
+    app: twintube
+    component: redis
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    protocol: TCP
+    name: redis
+  selector:
+    app: twintube
+    component: redis
+
+---
+# LoadBalancer for external access (university deployment)
+apiVersion: v1
+kind: Service
+metadata:
+  name: twintube-ingress-lb
+  namespace: twintube
+  labels:
+    app: twintube
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  ports:
+  - port: 80
+    targetPort: 3000
+    protocol: TCP
+    name: http
+  - port: 443
+    targetPort: 3000
+    protocol: TCP
+    name: https
+  selector:
+    app: twintube
+    component: frontend

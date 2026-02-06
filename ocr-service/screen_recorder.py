@@ -101,8 +101,8 @@ class YouTubeVideoExtractor:
         self.max_history_frames = 5
 
         # Tunable parameters
-        self.ocr_conf_threshold = 45.0  # minimum per-word confidence to consider
-        self.line_conf_threshold = 40.0  # minimum line-level confidence
+        self.ocr_conf_threshold = 30.0  # minimum per-word confidence to consider (lowered for recall)
+        self.line_conf_threshold = 35.0  # minimum line-level confidence
         self.top_k_regions = 12
         # Debugging: save annotated images for inspection when True
         self.debug_output = True if os.getenv('OCR_DEBUG', 'false').lower() == 'true' else False
@@ -382,6 +382,61 @@ class YouTubeVideoExtractor:
             if text.lower() in ui_only_words:
                 return False
         
+        # NEW: Filter out garbage OCR text
+        # Too many special characters relative to alphanumeric
+        alpha_count = sum(1 for c in text if c.isalnum())
+        special_count = sum(1 for c in text if not c.isalnum() and not c.isspace())
+        if alpha_count > 0 and special_count / alpha_count > 0.5:
+            return False
+        
+        # NEW: Filter text with too many single-character "words"
+        words = text.split()
+        if len(words) > 0:
+            single_char_words = sum(1 for w in words if len(w) == 1)
+            if single_char_words / len(words) > 0.4:
+                return False
+        
+        # NEW: Filter text that looks like random characters (low avg word length with many words)
+        if len(words) >= 4:
+            avg_word_len = sum(len(w) for w in words) / len(words)
+            if avg_word_len < 2.0:
+                return False
+        
+        # NEW: Filter text containing timestamp patterns mid-text (likely merged OCR)
+        if re.search(r'\d+:\d+\s+\d+:\d+', text):
+            return False
+        
+        # NEW: Filter text that's mostly pipe/bracket/special chars
+        if re.match(r'^[\|\[\]{}<>@#\-_\s]+$', text):
+            return False
+        
+        # NEW: Filter obvious garbage patterns
+        if re.search(r'[a-z]\s+[a-z]\s+[a-z]\s+[a-z]\s+[a-z]', text.lower()):
+            # Looks like "e e t T h i e n" - single chars with spaces
+            return False
+        
+        # NEW: Filter YouTube navigation bar text (contains multiple category words)
+        nav_categories = ['home', 'gaming', 'music', 'sports', 'news', 'live', 'shorts', 
+                          'subscriptions', 'library', 'history', 'trending', 'explore',
+                          'slam dunks', 'golden state', 'italian cuisine', 'speedruns',
+                          'gordon ramsay', 'mixes', 'among us', 'warriors']
+        text_lower = text.lower()
+        nav_matches = sum(1 for cat in nav_categories if cat in text_lower)
+        if nav_matches >= 3:
+            return False
+        
+        # NEW: Filter text that looks like concatenated category list
+        # (many capitalized words with no connecting words)
+        if len(words) >= 5:
+            capitalized = sum(1 for w in words if w and w[0].isupper())
+            if capitalized / len(words) > 0.7:
+                # Most words are capitalized - likely category/topic list
+                # Check if it lacks articles/prepositions typical in sentences
+                connectors = {'the', 'a', 'an', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'and', 'is', 'are', 'was', 'were'}
+                has_connector = any(w.lower() in connectors for w in words)
+                if not has_connector and len(words) >= 6:
+                    return False
+        
         return True
     
     def _aggregate_frame_results(self, video_data: Dict) -> Dict:
@@ -487,12 +542,127 @@ class YouTubeVideoExtractor:
                     out_tokens.append(t)
                     prev_norm = t
                 continue
+            # Only collapse immediate duplicates (common OCR artifact like 'Hi Hi')
             if norm == prev_norm:
+                # skip the duplicate token
                 continue
             out_tokens.append(t)
             prev_norm = norm
 
         return ' '.join(out_tokens)
+
+    def _group_lines_by_vertical_gaps(self, lines: List[Dict], gap_multiplier: float = 1.5, min_gap_px: int = 18) -> List[List[Dict]]:
+        """
+        Group line-level regions into subgroups using vertical gaps.
+
+        Args:
+            lines: list of line regions (must contain 'y' and 'h') sorted by y
+            gap_multiplier: multiplier on average line height to determine a split
+            min_gap_px: minimum pixel gap to consider
+
+        Returns:
+            List of grouped line lists
+        """
+        if not lines:
+            return []
+
+        sorted_lines = sorted(lines, key=lambda r: r['y'])
+        heights = [r.get('h', 20) for r in sorted_lines]
+        avg_h = sum(heights) / len(heights) if heights else 20
+        groups = []
+        cur = [sorted_lines[0]]
+
+        for prev, curr in zip(sorted_lines, sorted_lines[1:]):
+            gap = curr['y'] - (prev['y'] + prev.get('h', 0))
+            threshold = max(min_gap_px, int(avg_h * gap_multiplier))
+            if gap > threshold:
+                groups.append(cur)
+                cur = [curr]
+            else:
+                cur.append(curr)
+
+        if cur:
+            groups.append(cur)
+
+        return groups
+
+    def _segment_by_view_lines(self, text_regions: List[Dict], max_above_px: int = 260) -> List[List[Dict]]:
+        """
+        Segment the page into groups based on detected view-count or duration lines.
+        For each view/duration line, collect lines above it within `max_above_px` pixels
+        until the previous view/duration line. This helps identify video cards even
+        when the contour-based block detection fails.
+        Returns list of line groups (each group is a list of regions sorted by y).
+        """
+        if not text_regions:
+            return []
+
+        # Patterns
+        view_pat = re.compile(r'[\d,\.]+\s*[KMkm]?\s*views?', re.IGNORECASE)
+        duration_pat = re.compile(r'\d{1,2}:\d{2}(?::\d{2})?')
+
+        # Find candidate bottom lines (views or duration)
+        bottoms = []
+        for r in text_regions:
+            t = r.get('text', '')
+            if view_pat.search(t) or duration_pat.search(t):
+                bottoms.append(r)
+
+        if not bottoms:
+            return []
+
+        bottoms_sorted = sorted(bottoms, key=lambda r: r['y'])
+        groups = []
+        prev_bottom_y = 0
+
+        for b in bottoms_sorted:
+            top_limit = max(0, b['y'] - max_above_px)
+            group = []
+            for r in text_regions:
+                ry = r.get('y', 0)
+                # include regions between prev_bottom_y and current bottom y, and above top_limit
+                if ry >= prev_bottom_y and ry <= b['y'] and ry >= top_limit:
+                    group.append(r)
+            if group:
+                group_sorted = sorted(group, key=lambda r: r['y'])
+                groups.append(group_sorted)
+            prev_bottom_y = b['y'] + b.get('h', 0)
+
+        return groups
+
+    def _split_possible_titles(self, text: str) -> List[str]:
+        """
+        Given a possibly-concatenated title string, attempt to split it into multiple
+        candidate titles. Strategy:
+        - First split on colons that are not part of time patterns (avoid splitting '4:34')
+        - If that yields only one part, fall back to splitting on patterns like ': 3' (older heuristic)
+        - Clean each part and return those that pass basic heuristics
+        """
+        if not text:
+            return []
+
+        # Split on colon that is not between digits (avoid time patterns)
+        parts = re.split(r'(?<!\d):(?!\d)', text)
+        if len(parts) <= 1:
+            # fallback: split on colon-digit patterns
+            parts = re.split(r":\s*\d+\b", text)
+
+        cleaned = []
+        for p in parts:
+            p = p.strip()
+            # strip leading/trailing non-alphanumeric punctuation
+            p = re.sub(r'^[^A-Za-z0-9]+|[^A-Za-z0-9]+$', '', p).strip()
+            if not p:
+                continue
+            # require at least two words (to avoid splitting on single labels)
+            if len(re.findall(r"\w+", p)) < 2:
+                continue
+            # apply heuristics
+            if not self._filter_text_by_heuristics(p, strict=False):
+                continue
+            cleaned.append(p)
+
+        return cleaned
     
     def extract_video_title(self, text_regions: List[Dict], image: np.ndarray) -> Optional[str]:
         """
@@ -556,59 +726,72 @@ class YouTubeVideoExtractor:
             score = area * conf * content_score * pos_weight * noise_penalty
             candidates.append((score, r))
 
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
-            best_score, best_region = candidates[0]
-            best_text = best_region.get('text', '')
-            # Final filter check
-            if self._filter_text_by_heuristics(best_text, strict=False):
-                print(f"[DEBUG] Title selected by scoring: '{best_text}' score={best_score:.1f}")
-                return best_text
-            else:
-                print(f"[DEBUG] Best candidate filtered out by heuristics: '{best_text}' score={best_score:.1f}")
+        # Define reasonable horizontal and vertical bounds for title search
+        center_x_start = int(width * 0.05)
+        center_x_end = int(width * 0.95)
+        top_region_y = int(height * 0.6)
 
-        # First try combining OCR text regions in top-center area
-        top_region_y = int(height * 0.35)
-        center_x_start = int(width * 0.1)
-        center_x_end = int(width * 0.9)
-
+        # Collect candidate regions in the top/center area (common title zone)
+        # But filter out regions at the very top (navigation bar) and those that span too wide
         title_candidates = []
         for region in text_regions:
-            # Be more lenient with individual words - don't filter here
-            if (region['y'] < top_region_y and
-                center_x_start < region['x'] < center_x_end and
-                len(region['text']) > 1):  # Allow single words
+            y = region.get('y', 0)
+            x = region.get('x', 0)
+            w = region.get('w', 0)
+            text = region.get('text', '')
+            
+            # Skip regions at the very top (likely nav bar) - y < 5% of height
+            if y < height * 0.05:
+                continue
+            
+            # Skip regions that span more than 70% of the width (likely nav bar or banner)
+            if w > width * 0.7:
+                continue
+            
+            # Skip if text contains multiple YouTube nav categories
+            nav_cats = ['home', 'gaming', 'music', 'shorts', 'subscriptions', 'live', 'sports']
+            text_lower = text.lower()
+            if sum(1 for cat in nav_cats if cat in text_lower) >= 2:
+                continue
+            
+            if (y < top_region_y and
+                center_x_start <= x <= center_x_end and
+                len(text) > 1):
                 title_candidates.append(region)
 
         title_candidates.sort(key=lambda x: (x['y'], x['x']))  # Sort top-to-bottom, left-to-right
 
         if title_candidates:
-            # Combine nearby words into title
-            title_parts = []
-            last_y = -1
-            for candidate in title_candidates:
-                # Check if this word is on the same line (within 30 pixels vertically)
-                if last_y == -1 or abs(candidate['y'] - last_y) < 30:
-                    title_parts.append(candidate['text'])
-                    last_y = candidate['y']
-                else:
-                    # Different line - stop here
+            # Build first-line string from top-most line
+            first_line_y = title_candidates[0]['y']
+            first_line_parts = [r['text'] for r in title_candidates if abs(r['y'] - first_line_y) < 30]
+            combined_first = ' '.join(first_line_parts).strip()
+
+            # Look for a second line immediately below that likely is part of the same title
+            second_line_text = None
+            for r in title_candidates:
+                if r['y'] > first_line_y + 18:
+                    sec_y = r['y']
+                    second_line_parts = [rr['text'] for rr in title_candidates if abs(rr['y'] - sec_y) < 30]
+                    second_line_text = ' '.join(second_line_parts).strip()
                     break
-            
-            if title_parts:
-                combined_title = ' '.join(title_parts)
-                # Apply heuristic filtering to the FINAL combined title
-                if self._filter_text_by_heuristics(combined_title, strict=True):
-                    print(f"[DEBUG] Title from regions: '{combined_title}' (accepted, strict=True)")
-                    return combined_title
-                else:
-                    print(f"[DEBUG] Combined title filtered out by strict rules: '{combined_title}'")
-                    # Try a more lenient filter before giving up
-                    if self._filter_text_by_heuristics(combined_title, strict=False):
-                        print(f"[DEBUG] Title from regions accepted with lenient filter: '{combined_title}'")
-                        return combined_title
-                    else:
-                        print(f"[DEBUG] Combined title rejected by lenient filter too: '{combined_title}'")
+
+            # If second line exists, prefer the combined two-line title when plausible
+            if second_line_text:
+                combined_two = (combined_first + ' ' + second_line_text).strip()
+                if self._filter_text_by_heuristics(combined_two, strict=False):
+                    print(f"[DEBUG] Title from regions (2-line): '{combined_two}'")
+                    return combined_two
+
+            # Otherwise, fallback to the single-line first-line candidate
+            if combined_first:
+                if self._filter_text_by_heuristics(combined_first, strict=True):
+                    print(f"[DEBUG] Title from regions: '{combined_first}'")
+                    return combined_first
+                if self._filter_text_by_heuristics(combined_first, strict=False):
+                    print(f"[DEBUG] Title from regions accepted leniently: '{combined_first}'")
+                    return combined_first
+                print(f"[DEBUG] Combined title filtered out: '{combined_first}'")
 
         # Fallback: run OCR on the top area crop (more aggressive)
         top_crop_h = int(height * 0.25)
@@ -848,29 +1031,47 @@ class YouTubeVideoExtractor:
                 if not block_lines:
                     continue
 
-                title = self.extract_video_title(block_lines, cropped_image)
-                channel = self.extract_channel_name(block_lines, cropped_image)
-                views = self.extract_view_count(block_lines, cropped_image)
-                duration = self.extract_video_duration(block_lines)
+                # First, attempt to subgroup lines within this block by vertical gaps
+                groups = self._group_lines_by_vertical_gaps(block_lines)
+                if not groups:
+                    groups = [block_lines]
 
-                # If the OCR produced multiple titles concatenated with patterns like ': 3',
-                # split them into separate video entries. Common OCR artifact is ': 3' between titles.
-                if title and re.search(r"\:\s*3\b", title):
-                    parts = [p.strip() for p in re.split(r"\:\s*3\b", title) if p.strip()]
-                    for p in parts:
-                        if not self._filter_text_by_heuristics(p, strict=False):
+                for grp in groups:
+                    title = self.extract_video_title(grp, cropped_image)
+                    channel = self.extract_channel_name(grp, cropped_image)
+                    views = self.extract_view_count(grp, cropped_image)
+                    duration = self.extract_video_duration(grp)
+
+                    # If title seems concatenated, attempt intelligent splitting
+                    if title:
+                        parts = self._split_possible_titles(title)
+                        if parts and len(parts) > 1:
+                            for p in parts:
+                                v = {
+                                    'title': p,
+                                    'channel': channel,
+                                    'views': views,
+                                    'duration': duration,
+                                    'timestamp': datetime.now().isoformat(),
+                                    'raw_text_regions': len(grp),
+                                    'text_regions': grp,
+                                    'block_bbox': (bx, by, bw, bh)
+                                }
+                                videos.append(v)
                             continue
-                        v = {
-                            'title': p,
-                            'channel': channel,
-                            'views': views,
-                            'duration': duration,
-                            'timestamp': datetime.now().isoformat(),
-                            'raw_text_regions': len(block_lines),
-                            'text_regions': block_lines,
-                            'block_bbox': (bx, by, bw, bh)
-                        }
-                        videos.append(v)
+
+                    # Otherwise add single entry for this grouped region
+                    video_data = {
+                        'title': title,
+                        'channel': channel,
+                        'views': views,
+                        'duration': duration,
+                        'timestamp': datetime.now().isoformat(),
+                        'raw_text_regions': len(grp),
+                        'text_regions': grp,
+                        'block_bbox': (bx, by, bw, bh)
+                    }
+                    videos.append(video_data)
                 else:
                     video_data = {
                         'title': title,
@@ -892,31 +1093,26 @@ class YouTubeVideoExtractor:
             views = self.extract_view_count(text_regions, cropped_image)
             duration = self.extract_video_duration(text_regions)
 
-            if title and re.search(r":\s*\d+\b", title):
-                # Split on patterns like ': 3' or ':3' into multiple titles
-                parts = [p.strip() for p in re.split(r":\s*\d+\b", title) if p.strip()]
-                videos = []
-                for p in parts:
-                    p_clean = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", p).strip()
-                    if not p_clean:
-                        continue
-                    if not self._filter_text_by_heuristics(p_clean, strict=False):
-                        continue
-                    v = {
-                        'title': p_clean,
-                        'channel': channel,
-                        'views': views,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'raw_text_regions': len(text_regions),
-                        'text_regions': text_regions[:50]
-                    }
-                    videos.append(v)
+            if title:
+                parts = self._split_possible_titles(title)
+                if parts:
+                    videos = []
+                    for p in parts:
+                        v = {
+                            'title': p,
+                            'channel': channel,
+                            'views': views,
+                            'duration': duration,
+                            'timestamp': datetime.now().isoformat(),
+                            'raw_text_regions': len(text_regions),
+                            'text_regions': text_regions[:50]
+                        }
+                        videos.append(v)
 
-                if videos:
-                    result = {'multi': True, 'videos': videos, 'timestamp': datetime.now().isoformat()}
-                    print(f"[DEBUG] Fallback split into {len(videos)} videos")
-                    return result
+                    if videos:
+                        result = {'multi': True, 'videos': videos, 'timestamp': datetime.now().isoformat()}
+                        print(f"[DEBUG] Fallback split into {len(videos)} videos")
+                        return result
 
             # No splitting, return single
             video_data = {

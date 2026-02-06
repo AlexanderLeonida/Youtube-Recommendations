@@ -1,0 +1,140 @@
+# TwinTube Vector - ConfigMaps and Secrets
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: twintube
+  labels:
+    app: twintube
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: twintube-config
+  namespace: twintube
+  labels:
+    app: twintube
+data:
+  # Redis configuration
+  redis-host: "twintube-redis"
+  redis-port: "6379"
+  
+  # Application settings
+  log-level: "INFO"
+  environment: "production"
+  
+  # ML Model settings
+  model-version: "v1.0"
+  embedding-dim: "256"
+  top-k-default: "100"
+  
+  # Performance settings
+  use-quantization: "true"
+  use-gpu-index: "true"
+  batch-size: "128"
+  
+  # Rate limiting
+  rate-limit-requests: "1000"
+  rate-limit-window: "60"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: twintube-db-secret
+  namespace: twintube
+  labels:
+    app: twintube
+type: Opaque
+stringData:
+  host: "mysql.twintube.svc.cluster.local"
+  port: "3306"
+  username: "ytrecs"
+  password: "CHANGE_ME_IN_PRODUCTION"
+  database: "ytrecs"
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: twintube-registry-secret
+  namespace: twintube
+  labels:
+    app: twintube
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: e30=  # Base64 encoded Docker config
+
+---
+# PersistentVolumeClaims for model and index storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: twintube-models-pvc
+  namespace: twintube
+  labels:
+    app: twintube
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 10Gi
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: twintube-index-pvc
+  namespace: twintube
+  labels:
+    app: twintube
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 50Gi
+
+---
+# Redis deployment for caching
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: twintube-redis
+  namespace: twintube
+  labels:
+    app: twintube
+    component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: twintube
+      component: redis
+  template:
+    metadata:
+      labels:
+        app: twintube
+        component: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        command:
+        - redis-server
+        - --maxmemory
+        - 512mb
+        - --maxmemory-policy
+        - allkeys-lru

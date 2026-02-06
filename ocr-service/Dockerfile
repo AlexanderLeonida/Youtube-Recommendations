@@ -24,8 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Make start script executable
-RUN chmod +x ./start.sh
+# Make entrypoint executable
+RUN chmod +x entrypoint.sh
 
 # Expose port
 EXPOSE 5000
@@ -34,5 +34,5 @@ EXPOSE 5000
 ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
 
 # Start Xvfb then run the Flask app
-CMD ["./start.sh"]
+CMD ["./entrypoint.sh"]
 

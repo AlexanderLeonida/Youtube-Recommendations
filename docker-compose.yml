@@ -19,6 +19,19 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: youtube-recommendations-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   backend:
     build: ./backend
     container_name: youtube-recommendations-backend
@@ -30,6 +43,8 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     volumes:
       - ./backend:/usr/src/app
       - /usr/src/app/node_modules
@@ -39,6 +54,8 @@ services:
       DB_PASSWORD: password
       DB_NAME: ytrecs
       DB_PORT: 3306
+      ML_SERVICE_URL: http://ml-service:8000
+      OCR_SERVICE_URL: http://ocr-service:5000
 
   frontend:
     build: ./frontend
@@ -77,5 +94,45 @@ services:
       backend:
         condition: service_started
 
+  # TwinTube ML Recommendation Service
+  ml-service:
+    build: ./ml
+    container_name: youtube-recommendations-ml
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_PATH: /app/checkpoints/best_model.pt
+      INDEX_PATH: /app/index/video_embeddings.faiss
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      USE_QUANTIZATION: "true"
+      USE_GPU_INDEX: "false"
+      USE_REDIS_CACHE: "true"
+    volumes:
+      - ml-models:/app/checkpoints
+      - ml-index:/app/index
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # C++ OpenCV OCR (for high-performance processing)
+  opencv-ocr:
+    build: ./opencv
+    container_name: youtube-recommendations-opencv
+    restart: "no"
+    profiles:
+      - tools
+    volumes:
+      - ./opencv/input:/usr/src/app/input
+      - ./opencv/output:/usr/src/app/output
+
 volumes:
   mysql-data:
+  ml-models:
+  ml-index:

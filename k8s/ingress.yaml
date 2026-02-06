@@ -1,0 +1,96 @@
+# TwinTube Vector - Ingress Configuration
+# Routes external traffic to services with TLS termination
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: twintube-ingress
+  namespace: twintube
+  labels:
+    app: twintube
+  annotations:
+    kubernetes.io/ingress.class: nginx
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Rate limiting
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "50"
+spec:
+  tls:
+  - hosts:
+    - twintube.university.edu
+    - api.twintube.university.edu
+    secretName: twintube-tls-secret
+  rules:
+  - host: twintube.university.edu
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: twintube-frontend
+            port:
+              number: 3000
+  - host: api.twintube.university.edu
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: twintube-backend
+            port:
+              number: 4000
+      - path: /ml
+        pathType: Prefix
+        backend:
+          service:
+            name: twintube-ml
+            port:
+              number: 8000
+      - path: /ocr
+        pathType: Prefix
+        backend:
+          service:
+            name: twintube-ocr
+            port:
+              number: 5000
+
+---
+# Network Policy for security
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: twintube-network-policy
+  namespace: twintube
+spec:
+  podSelector:
+    matchLabels:
+      app: twintube
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app: twintube
+  egress:
+  - to:
+    - podSelector:
+        matchLabels:
+          app: twintube
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53

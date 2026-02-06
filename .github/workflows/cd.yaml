@@ -1,0 +1,191 @@
+# TwinTube Vector - CD Pipeline
+# Continuous Deployment: Zero-downtime rolling deployments to Kubernetes
+
+name: CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+  KUBE_NAMESPACE: twintube
+
+jobs:
+  # ============================================
+  # Deploy to Staging
+  # ============================================
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.twintube.university.edu
+    if: github.event_name == 'push' || github.event.inputs.environment == 'staging'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure Kubernetes context
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+
+      - name: Update image tags in manifests
+        run: |
+          export IMAGE_TAG="${{ github.sha }}"
+          for file in k8s/*.yaml; do
+            sed -i "s|twintube/\([^:]*\):latest|${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/\1:${IMAGE_TAG}|g" "$file"
+          done
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/configmaps.yaml
+          kubectl apply -f k8s/services.yaml
+          kubectl apply -f k8s/deployments.yaml
+          kubectl apply -f k8s/hpa.yaml
+          kubectl apply -f k8s/ingress.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/twintube-backend -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/twintube-frontend -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get services -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get hpa -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Run smoke tests
+        run: |
+          # Wait for services to be ready
+          sleep 30
+          
+          # Test endpoints
+          FRONTEND_IP=$(kubectl get svc twintube-frontend -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.spec.clusterIP}')
+          BACKEND_IP=$(kubectl get svc twintube-backend -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.spec.clusterIP}')
+          ML_IP=$(kubectl get svc twintube-ml -n ${{ env.KUBE_NAMESPACE }} -o jsonpath='{.spec.clusterIP}')
+          
+          echo "Running health checks..."
+          kubectl run curl-test --image=curlimages/curl --rm -i --restart=Never -- \
+            curl -sf http://$ML_IP:8000/health || echo "ML service not responding"
+
+  # ============================================
+  # Deploy to Production
+  # ============================================
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment:
+      name: production
+      url: https://twintube.university.edu
+    if: github.event.inputs.environment == 'production'
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure Kubernetes context
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+
+      - name: Update image tags in manifests
+        run: |
+          export IMAGE_TAG="${{ github.sha }}"
+          for file in k8s/*.yaml; do
+            sed -i "s|twintube/\([^:]*\):latest|${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/\1:${IMAGE_TAG}|g" "$file"
+          done
+
+      - name: Apply Kubernetes manifests with canary
+        run: |
+          # Apply configs and services first
+          kubectl apply -f k8s/configmaps.yaml
+          kubectl apply -f k8s/services.yaml
+          
+          # Canary deployment - 10% traffic first
+          kubectl set image deployment/twintube-ml \
+            ml-service=${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/ml-service:${{ github.sha }} \
+            -n ${{ env.KUBE_NAMESPACE }} \
+            --record
+          
+          kubectl rollout pause deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }}
+          
+      - name: Monitor canary (5 minutes)
+        run: |
+          echo "Monitoring canary deployment for 5 minutes..."
+          sleep 300
+          
+          # Check for errors in logs
+          ERROR_COUNT=$(kubectl logs -l component=ml-service -n ${{ env.KUBE_NAMESPACE }} --tail=1000 | grep -c "ERROR" || echo "0")
+          
+          if [ "$ERROR_COUNT" -gt 10 ]; then
+            echo "Too many errors detected, rolling back..."
+            kubectl rollout undo deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }}
+            exit 1
+          fi
+
+      - name: Complete rollout
+        run: |
+          kubectl rollout resume deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout status deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          
+          # Roll out remaining services
+          kubectl apply -f k8s/deployments.yaml
+          kubectl apply -f k8s/hpa.yaml
+          kubectl apply -f k8s/ingress.yaml
+          
+          kubectl rollout status deployment/twintube-backend -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+          kubectl rollout status deployment/twintube-frontend -n ${{ env.KUBE_NAMESPACE }} --timeout=300s
+
+      - name: Post-deployment verification
+        run: |
+          kubectl get pods -n ${{ env.KUBE_NAMESPACE }}
+          kubectl get hpa -n ${{ env.KUBE_NAMESPACE }}
+          
+          echo "Deployment successful!"
+
+  # ============================================
+  # Rollback Job (manual trigger)
+  # ============================================
+  rollback:
+    runs-on: ubuntu-latest
+    if: failure()
+    needs: [deploy-staging, deploy-production]
+    
+    steps:
+      - name: Rollback deployments
+        run: |
+          kubectl rollout undo deployment/twintube-ml -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout undo deployment/twintube-backend -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout undo deployment/twintube-frontend -n ${{ env.KUBE_NAMESPACE }}
+          kubectl rollout undo deployment/twintube-ocr -n ${{ env.KUBE_NAMESPACE }}
+
+      - name: Notify team
+        uses: slackapi/slack-github-action@v1
+        with:
+          channel-id: 'deployments'
+          slack-message: ':warning: Deployment rolled back for ${{ github.repository }}'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}

@@ -15,6 +15,7 @@ import base64
 import numpy as np
 import cv2
 from io import BytesIO
+from typing import List, Dict
 
 load_dotenv()
 
@@ -97,8 +98,240 @@ def get_db_connection():
         return None
 
 
+def extract_videos_from_text_regions(video_data: dict) -> List[dict]:
+    """
+    Extract valid video titles directly from raw text_regions.
+    This is a fallback when the main extraction produces garbage.
+    """
+    import re
+    from datetime import datetime
+    
+    if not isinstance(video_data, dict):
+        return []
+    
+    # Get text_regions from single video or multi-video
+    text_regions = []
+    if video_data.get('multi'):
+        for v in video_data.get('videos', []):
+            text_regions.extend(v.get('text_regions', []))
+    else:
+        text_regions = video_data.get('text_regions', [])
+    
+    if not text_regions:
+        return []
+    
+    # YouTube UI elements to completely skip
+    ui_skip_patterns = [
+        r'^watch\s*later\s*\d*$', r'^liked\s*videos?\s*$', r'^your\s*videos?\s*$',
+        r'^subscriptions?$', r'^history$', r'^library$', r'^home$',
+        r'^\d+\s*(views?|watching)$', r'^\d+[KMB]?\s*views?$',
+    ]
+    
+    # Prefixes to strip from the beginning of text
+    ui_prefixes = [
+        r'^\d+\)\s*liked\s*videos?\s*[&\s]*',  # "2) Liked videos &"
+        r'^\d+\)\s*watch\s*later\s*[&\s]*',    # "1) Watch later &"
+        r'^\d+\)\s*your\s*videos?\s*[&\s]*',   # "3) Your videos &"
+        r'^watch\s*later\s*\d*\s*[&\s]*',      # "Watch later 49 &"
+        r'^liked\s*videos?\s*[&\s]*',          # "Liked videos &"
+        r'^your\s*videos?\s*[&\s]*',           # "Your videos &"
+        r'^\[\]\s*videos?\s*',                 # "[] videos"
+        r'^[\[\]\(\)\{\}<>&,\.\s\d]+(?=[A-Z])', # Leading garbage before capital letter
+    ]
+    
+    # Navigation words
+    nav_words = {'home', 'gaming', 'music', 'sports', 'shorts', 'subscriptions', 
+                 'live', 'trending', 'explore', 'library', 'history'}
+    
+    videos = []
+    seen_titles = set()
+    
+    for region in text_regions:
+        text = region.get('text', '')
+        conf = region.get('conf', 0)
+        y = region.get('y', 0)
+        
+        # Lower confidence threshold to get more videos
+        if conf < 75:
+            continue
+        
+        # Skip regions at very top (likely nav)
+        if y < 80:
+            continue
+        
+        # Split by colons to separate merged titles
+        parts = re.split(r'\s*:\s*', text)
+        
+        for part in parts:
+            part = part.strip()
+            
+            # Clean up UI prefixes first
+            for prefix_pattern in ui_prefixes:
+                part = re.sub(prefix_pattern, '', part, flags=re.I)
+            part = part.strip()
+            
+            # Clean up other garbage prefixes
+            part = re.sub(r'^[\[\]\(\)\{\}<>&,\.\s]+', '', part)
+            part = re.sub(r'^(soc|sug|via|anNYC|Ms)\s*[,\s]+', '', part, flags=re.I)
+            part = part.strip()
+            
+            # Skip too short or too long
+            if len(part) < 10 or len(part) > 80:
+                continue
+            
+            # Skip YouTube UI elements (exact matches)
+            skip = False
+            for pattern in ui_skip_patterns:
+                if re.match(pattern, part, re.I):
+                    skip = True
+                    break
+            if skip:
+                continue
+            
+            # Skip if starts with @ (channel name)
+            if part.startswith('@'):
+                continue
+            
+            # Skip if looks like view count or timestamp embedded
+            if re.search(r'\d+[KMB]?\s*views?\s*\d+\s*(months?|years?|days?|hours?)\s*ago', part, re.I):
+                continue
+            if re.match(r'^\d+:\d+', part):
+                continue
+            
+            # Skip if contains too many nav words
+            words_lower = part.lower().split()
+            nav_count = sum(1 for w in words_lower if w in nav_words)
+            if nav_count >= 3:  # Relaxed from 2 to 3
+                continue
+            
+            # Skip if mostly channel names (multiple @)
+            if part.count('@') >= 2:
+                continue
+            
+            # Skip garbage patterns
+            words = part.split()
+            if len(words) < 2:  # Relaxed from 3 to 2
+                continue
+            
+            # Count meaningful words (3+ chars, alphanumeric)
+            meaningful = [w for w in words if len(w) >= 3 and any(c.isalnum() for c in w)]
+            if len(meaningful) < 2:
+                continue
+            
+            # Check for too many single-char words
+            single_char = sum(1 for w in words if len(w) == 1)
+            if len(words) > 0 and single_char / len(words) > 0.35:  # Relaxed from 0.25
+                continue
+            
+            # Check alpha ratio - must have decent text
+            alpha_count = sum(1 for c in part if c.isalpha())
+            if len(part) > 0 and alpha_count / len(part) < 0.45:  # Relaxed from 0.55
+                continue
+            
+            # Normalize for dedup
+            norm = re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9 ]', '', part)).strip().lower()
+            if not norm or norm in seen_titles:
+                continue
+            if len(norm) < 8:  # Relaxed from 10
+                continue
+            
+            seen_titles.add(norm)
+            
+            video = {
+                'title': part,
+                'channel': None,
+                'views': None,
+                'duration': None,
+                'timestamp': datetime.now().isoformat(),
+                'source': 'text_region_extraction'
+            }
+            videos.append(video)
+            print(f"[TEXT_REGION] Extracted title: {part[:50]}")
+    
+    return videos[:10]  # Limit to 10 videos per frame
+
+
+def is_valid_video_data(video_data: dict) -> bool:
+    """Validate if extracted video data looks reasonable."""
+    import re
+    
+    title = video_data.get('title', '')
+    if not title or len(title) < 5:
+        print(f"[VALIDATION] Rejected: too short - {title[:50]}")
+        return False
+    
+    # Title should have at least 2 actual words (3+ chars)
+    words = title.split()
+    meaningful_words = [w for w in words if len(w) >= 3 and any(c.isalnum() for c in w)]
+    if len(meaningful_words) < 2:
+        print(f"[VALIDATION] Rejected: needs 2+ meaningful words - {title[:50]}")
+        return False
+    
+    # CRITICAL: Reject YouTube navigation bar text
+    nav_categories = ['home', 'gaming', 'music', 'sports', 'news', 'live', 'shorts', 
+                      'subscriptions', 'library', 'history', 'trending', 'explore',
+                      'slam dunks', 'golden state', 'italian cuisine', 'speedruns',
+                      'gordon ramsay', 'mixes', 'among us', 'warriors', 'slam dunk']
+    title_lower = title.lower()
+    nav_matches = sum(1 for cat in nav_categories if cat in title_lower)
+    if nav_matches >= 3:
+        print(f"[VALIDATION] Rejected: looks like nav bar ({nav_matches} category matches) - {title[:50]}")
+        return False
+    
+    # Reject text starting with common nav patterns
+    if title_lower.startswith(('home ', 'home gaming', 'gaming music', 'shorts ', 'subscriptions')):
+        print(f"[VALIDATION] Rejected: starts with nav pattern - {title[:50]}")
+        return False
+    
+    # Too many special characters
+    alpha_count = sum(1 for c in title if c.isalnum())
+    special_count = sum(1 for c in title if not c.isalnum() and not c.isspace())
+    if alpha_count > 0 and special_count / alpha_count > 0.25:
+        print(f"[VALIDATION] Rejected: too many special chars ({special_count}/{alpha_count}) - {title[:50]}")
+        return False
+    
+    # Too many single-char words
+    single_char_words = sum(1 for w in words if len(w) == 1)
+    if len(words) > 0 and single_char_words / len(words) > 0.3:
+        print(f"[VALIDATION] Rejected: too many single-char words - {title[:50]}")
+        return False
+    
+    # Average word length too short (random char soup)
+    if len(words) >= 3:
+        avg_word_len = sum(len(w) for w in words) / len(words)
+        if avg_word_len < 2.5:
+            print(f"[VALIDATION] Rejected: avg word len {avg_word_len:.1f} too short - {title[:50]}")
+            return False
+    
+    # Contains timestamp patterns (likely merged OCR)
+    if re.search(r'\d+:\d+\s+\d+:\d+', title):
+        print(f"[VALIDATION] Rejected: contains timestamp pattern - {title[:50]}")
+        return False
+    
+    # Reject pure random patterns like "ae en y 20" or "TT fi Tsk wD"
+    # These have too many 2-char "words"
+    short_words = sum(1 for w in words if len(w) <= 2)
+    if len(words) >= 4 and short_words / len(words) > 0.5:
+        print(f"[VALIDATION] Rejected: too many short words - {title[:50]}")
+        return False
+    
+    # Reject if most characters are non-ASCII or symbols
+    ascii_alpha = sum(1 for c in title if c.isascii() and c.isalpha())
+    if len(title) > 0 and ascii_alpha / len(title) < 0.4:
+        print(f"[VALIDATION] Rejected: low ASCII alpha ratio - {title[:50]}")
+        return False
+    
+    print(f"[VALIDATION] Accepted: {title[:50]}")
+    return True
+
+
 def save_video_data(video_data: dict):
     """Save extracted video data to database."""
+    # Validate video data first
+    if not is_valid_video_data(video_data):
+        print(f"[SAVE] Skipping invalid video data: {video_data.get('title', 'N/A')[:50]}")
+        return False
+    
     conn = get_db_connection()
     if not conn:
         return False
@@ -293,6 +526,18 @@ def upload_frame():
         # Use existing extractor to get video data
         video_data = recorder.extractor.extract_video_data(frame)
         print(f"[UPLOAD_FRAME] Extracted video_data: {video_data}")
+
+        # NEW: Try to extract valid titles from raw text_regions if main extraction fails
+        extracted_videos = extract_videos_from_text_regions(video_data)
+        if extracted_videos:
+            saved_any = 0
+            for v in extracted_videos:
+                ok = save_video_data(v)
+                print(f"[UPLOAD_FRAME] save_video_data returned: {ok} for title={v.get('title')}")
+                if ok:
+                    saved_any += 1
+            if saved_any > 0:
+                return jsonify({'status': 'success', 'videos_saved': saved_any, 'video_data': {'extracted_from_regions': True, 'count': saved_any}})
 
         # Support multi-video payloads
         try:
