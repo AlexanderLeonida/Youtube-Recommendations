@@ -256,6 +256,83 @@ app.get('/api/training-data', (req, res) => {
   });
 });
 
+// ── ML service proxy ────────────────────────────────────────────────────────
+
+const ML_SERVICE_URL = process.env.ML_SERVICE_URL || 'http://ml-service:8000';
+
+app.post('/api/ml/train', async (req, res) => {
+  try {
+    const response = await axios.post(`${ML_SERVICE_URL}/train`, req.body || {});
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { error: 'ML service unavailable', details: error.message }
+    );
+  }
+});
+
+app.get('/api/ml/train/status', async (req, res) => {
+  try {
+    const response = await axios.get(`${ML_SERVICE_URL}/train/status`);
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { error: 'ML service unavailable' }
+    );
+  }
+});
+
+app.post('/api/ml/recommend', async (req, res) => {
+  try {
+    const response = await axios.post(`${ML_SERVICE_URL}/recommend_from_history`, req.body || {});
+    const data = response.data;
+
+    // Enrich recommendations with titles/channels from browse_events
+    const recs = data.recommendations || [];
+    const videoIds = recs.map((r) => r.video_id).filter((v) => v && v !== 'unknown');
+
+    if (videoIds.length > 0) {
+      const placeholders = videoIds.map(() => '?').join(',');
+      const sql = `
+        SELECT video_id, title, channel_name, views, duration
+        FROM browse_events
+        WHERE video_id IN (${placeholders}) AND title IS NOT NULL
+        GROUP BY video_id
+        ORDER BY MAX(created_at) DESC
+      `;
+      const [rows] = await db.promise().query(sql, videoIds);
+      const metaMap = {};
+      for (const row of rows) {
+        metaMap[row.video_id] = row;
+      }
+      for (const rec of recs) {
+        const meta = metaMap[rec.video_id];
+        if (meta) {
+          rec.title = meta.title;
+          rec.channel = meta.channel_name;
+          rec.views = meta.views;
+          rec.duration = meta.duration;
+        }
+      }
+    }
+
+    res.json(data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { error: 'ML service unavailable', details: error.message }
+    );
+  }
+});
+
+app.get('/api/ml/health', async (req, res) => {
+  try {
+    const response = await axios.get(`${ML_SERVICE_URL}/health`);
+    res.json(response.data);
+  } catch (error) {
+    res.json({ status: 'unavailable', error: error.message });
+  }
+});
+
 app.listen(process.env.PORT || 4000, '0.0.0.0', () => {
   console.log(`Backend server listening on port ${process.env.PORT || 4000}`);
 });

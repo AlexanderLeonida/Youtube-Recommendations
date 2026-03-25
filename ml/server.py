@@ -274,6 +274,158 @@ async def index_status():
     }
 
 
+# ── Training from browse events ─────────────────────────────────────────────
+
+class TrainRequest(BaseModel):
+    epochs: int = Field(default=10, ge=1, le=100)
+    batch_size: int = Field(default=32, ge=2, le=512)
+    learning_rate: float = Field(default=1e-3, gt=0)
+
+
+@app.post("/train")
+async def train_model(req: TrainRequest, background_tasks: BackgroundTasks):
+    """
+    Train the two-tower model from Chrome extension browse events.
+    Runs in background so the request returns immediately.
+    """
+    from train_from_events import train_from_events
+
+    def _run():
+        result = train_from_events(
+            epochs=req.epochs,
+            batch_size=req.batch_size,
+            lr=req.learning_rate,
+            backend_url=os.getenv("BACKEND_URL", "http://backend:4000"),
+        )
+        logger.info(f"Training complete: {result}")
+        # Reload model after training
+        global engine
+        if result.get("status") == "success" and engine is not None:
+            try:
+                engine._load_model()
+                index_path = os.getenv("INDEX_PATH", "./index/video_embeddings.faiss")
+                if os.path.exists(index_path):
+                    engine.index.load(index_path)
+                logger.info("Reloaded model and index after training")
+            except Exception as e:
+                logger.error(f"Failed to reload after training: {e}")
+
+    background_tasks.add_task(_run)
+    return {"status": "training_started", "epochs": req.epochs}
+
+
+@app.get("/train/status")
+async def train_status():
+    """Check if a trained model exists."""
+    model_path = os.getenv("MODEL_PATH", "./checkpoints/best_model.pt")
+    mapper_path = "./checkpoints/id_mapper.json"
+    index_path = os.getenv("INDEX_PATH", "./index/video_embeddings.faiss")
+
+    return {
+        "model_exists": os.path.exists(model_path),
+        "id_mapper_exists": os.path.exists(mapper_path),
+        "index_exists": os.path.exists(index_path),
+    }
+
+
+class BrowseRecommendRequest(BaseModel):
+    """Recommend videos based on the user's recent browse history."""
+    session_id: Optional[str] = None  # If None, uses all sessions
+    top_k: int = Field(default=20, ge=1, le=100)
+
+
+@app.post("/recommend_from_history")
+async def recommend_from_history(req: BrowseRecommendRequest):
+    """
+    Get recommendations using the user's actual browse history from the extension.
+    Fetches click history from the backend, encodes it, and searches the index.
+    """
+    import requests as http_requests
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
+    mapper_path = "./checkpoints/id_mapper.json"
+    if not os.path.exists(mapper_path):
+        raise HTTPException(status_code=400, detail="No trained model. Train the model first.")
+
+    # Load ID mapper
+    import json
+    with open(mapper_path) as f:
+        mapper_data = json.load(f)
+    video_to_int = mapper_data["video_to_int"]
+    int_to_video = {int(k): v for k, v in mapper_data["int_to_video"].items()}
+    int_to_channel = {int(k): v for k, v in mapper_data.get("int_to_channel", {}).items()}
+
+    # Fetch user's click history
+    backend_url = os.getenv("BACKEND_URL", "http://backend:4000")
+    try:
+        params = {"type": "click", "limit": 100}
+        resp = http_requests.get(f"{backend_url}/api/events", params=params, timeout=10)
+        resp.raise_for_status()
+        clicks = resp.json().get("events", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch browse history: {e}")
+
+    if not clicks:
+        raise HTTPException(status_code=400, detail="No click history found. Browse YouTube first.")
+
+    # Filter by session if specified
+    if req.session_id:
+        clicks = [c for c in clicks if c["session_id"] == req.session_id]
+
+    # Map to int IDs
+    watch_history = []
+    watch_times = []
+    for c in clicks:
+        vid = c.get("video_id", "")
+        if vid in video_to_int:
+            watch_history.append(video_to_int[vid])
+            watch_times.append(float(c.get("watch_duration_sec") or 60))
+
+    if not watch_history:
+        raise HTTPException(
+            status_code=400,
+            detail="None of your watched videos are in the trained model. Retrain after more browsing.",
+        )
+
+    # Pad/truncate to 50
+    max_len = 50
+    if len(watch_history) > max_len:
+        watch_history = watch_history[-max_len:]
+        watch_times = watch_times[-max_len:]
+
+    engagement = [[0.0, 0.0, 0.0]] * len(watch_history)
+
+    # Get recommendations from engine
+    user_features = {
+        "watch_history": watch_history,
+        "watch_times": watch_times,
+        "engagement": engagement,
+    }
+
+    try:
+        result = engine.get_recommendations(user_features, top_k=req.top_k, use_cache=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Recommendation failed: {e}")
+
+    # Map int IDs back to YouTube IDs and titles
+    recommendations = []
+    for int_id, score in zip(result["video_ids"], result["scores"]):
+        yt_id = int_to_video.get(int(int_id), "unknown")
+        recommendations.append({
+            "video_id": yt_id,
+            "score": float(score),
+            "youtube_url": f"https://www.youtube.com/watch?v={yt_id}" if yt_id != "unknown" else None,
+        })
+
+    return {
+        "recommendations": recommendations,
+        "history_size": len(watch_history),
+        "latency_ms": result["latency_ms"],
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

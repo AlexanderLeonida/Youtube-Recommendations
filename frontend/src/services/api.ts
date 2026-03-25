@@ -25,4 +25,22 @@ export const api = {
     axios.get(`${API_BASE_URL}/api/training-data`, {
       params: { limit: limit || 500 },
     }),
+
+  // ML model endpoints
+  trainModel: (epochs?: number, batchSize?: number) =>
+    axios.post(`${API_BASE_URL}/api/ml/train`, {
+      epochs: epochs || 10,
+      batch_size: batchSize || 32,
+    }),
+
+  getTrainStatus: () =>
+    axios.get(`${API_BASE_URL}/api/ml/train/status`),
+
+  getRecommendations: (topK?: number) =>
+    axios.post(`${API_BASE_URL}/api/ml/recommend`, {
+      top_k: topK || 20,
+    }),
+
+  getMLHealth: () =>
+    axios.get(`${API_BASE_URL}/api/ml/health`),
 };

@@ -1,70 +1,153 @@
 /**
  * TwinTube Tracker - YouTube browsing behavior tracker.
  *
- * Tracks two types of events:
- *   1. Impressions: videos visible in the user's viewport (feed, sidebar, search)
+ * Tracks:
+ *   1. Impressions: videos visible in the user's viewport
  *   2. Clicks: videos the user navigates to watch
- *
- * Sends events to the backend API for storage and ML training.
+ *   3. Watch duration: how long the user watches each video
  */
 
 const BACKEND_URL = "http://localhost:4000";
-const IMPRESSION_THRESHOLD_MS = 1000; // Video must be visible for 1s to count
-const SEND_INTERVAL_MS = 5000; // Batch-send events every 5s
+const IMPRESSION_THRESHOLD_MS = 1000;
+const SEND_INTERVAL_MS = 5000;
 const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
 // ── State ──────────────────────────────────────────────────────────────────
 
-const pendingImpressions = new Map(); // videoId -> {videoData, visibleSince}
-const sentImpressions = new Set();    // videoIds already sent this page
-let eventQueue = [];                  // batched events waiting to send
-let currentWatchVideoId = null;       // video ID if we're on a watch page
-let watchStartTime = null;            // when the current watch started
+const pendingImpressions = new Map();
+const sentImpressions = new Set();
+let eventQueue = [];
+let currentWatchVideoId = null;
+let watchStartTime = null;
 
 // ── Video extraction from DOM ──────────────────────────────────────────────
 
 function extractVideoFromCard(card) {
-  const titleEl = card.querySelector("#video-title");
-  if (!titleEl) return null;
-
-  const title = (titleEl.getAttribute("title") || titleEl.textContent || "").trim();
+  // Try multiple selectors for the title — YouTube changes these across redesigns
+  let title = null;
+  let titleEl = card.querySelector("#video-title");
+  if (titleEl) {
+    title = titleEl.getAttribute("title") || titleEl.textContent || "";
+  }
+  if (!title || title.trim().length < 3) {
+    // Fallback: look for any <a> with a title attribute containing video info
+    const titleLink = card.querySelector("a[title]");
+    if (titleLink) {
+      title = titleLink.getAttribute("title") || "";
+    }
+  }
+  if (!title || title.trim().length < 3) {
+    // Fallback: yt-formatted-string inside a title container
+    const ytStr = card.querySelector("yt-formatted-string#video-title, h3 a, h3 yt-formatted-string");
+    if (ytStr) {
+      title = ytStr.textContent || "";
+    }
+  }
+  title = (title || "").trim();
   if (!title || title.length < 3) return null;
 
   // Video ID from link
   let videoId = null;
-  const link = card.querySelector("a#thumbnail, a#video-title, a[href*='watch']");
-  if (link) {
+  const links = card.querySelectorAll("a[href]");
+  for (const link of links) {
     const href = link.getAttribute("href") || "";
-    const match = href.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
-    if (match) videoId = match[1];
+    const match = href.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
+    if (match) {
+      videoId = match[1];
+      break;
+    }
+    // Also handle /shorts/
+    const shortsMatch = href.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
+    if (shortsMatch) {
+      videoId = shortsMatch[1];
+      break;
+    }
   }
   if (!videoId) return null;
 
-  // Channel
+  // Channel — try several selectors
   let channel = null;
-  const chanEl =
-    card.querySelector("ytd-channel-name a") ||
-    card.querySelector("ytd-channel-name yt-formatted-string");
-  if (chanEl) channel = chanEl.textContent.trim();
+  const channelSelectors = [
+    "ytd-channel-name a",
+    "ytd-channel-name yt-formatted-string",
+    "#channel-name a",
+    "#channel-name yt-formatted-string",
+    ".ytd-channel-name",
+  ];
+  for (const sel of channelSelectors) {
+    const el = card.querySelector(sel);
+    if (el && el.textContent.trim()) {
+      channel = el.textContent.trim();
+      break;
+    }
+  }
 
   // Views + posted time
   let views = null;
   let postedAgo = null;
-  const metaSpans = card.querySelectorAll("#metadata-line span");
+  const metaSpans = card.querySelectorAll("#metadata-line span, .inline-metadata-item");
   metaSpans.forEach((span) => {
     const txt = span.textContent.trim();
-    if (/views?/i.test(txt)) views = txt;
-    else if (/ago|streamed|premiered/i.test(txt)) postedAgo = txt;
+    if (/views?/i.test(txt) && !views) views = txt;
+    else if (/ago|streamed|premiered/i.test(txt) && !postedAgo) postedAgo = txt;
   });
 
   // Duration
   let duration = null;
-  const durEl = card.querySelector(
-    "ytd-thumbnail-overlay-time-status-renderer span"
-  );
-  if (durEl) duration = durEl.textContent.trim();
+  const durSelectors = [
+    "ytd-thumbnail-overlay-time-status-renderer span",
+    "badge-shape .badge-shape-wiz__text",
+    "#time-status span",
+  ];
+  for (const sel of durSelectors) {
+    const el = card.querySelector(sel);
+    if (el && el.textContent.trim()) {
+      duration = el.textContent.trim();
+      break;
+    }
+  }
 
   return { videoId, title, channel, views, duration, postedAgo };
+}
+
+// ── Watch page title extraction with retry ─────────────────────────────────
+
+function extractWatchPageInfo() {
+  // Try multiple selectors for the watch page title
+  const titleSelectors = [
+    "h1.ytd-watch-metadata yt-formatted-string",
+    "yt-formatted-string.ytd-watch-metadata",
+    "h1.ytd-video-primary-info-renderer yt-formatted-string",
+    "#title h1 yt-formatted-string",
+    "ytd-watch-metadata #title yt-formatted-string",
+    "#above-the-fold #title yt-formatted-string",
+  ];
+  let title = null;
+  for (const sel of titleSelectors) {
+    const el = document.querySelector(sel);
+    if (el && el.textContent.trim().length > 2) {
+      title = el.textContent.trim();
+      break;
+    }
+  }
+
+  const channelSelectors = [
+    "ytd-video-owner-renderer ytd-channel-name a",
+    "ytd-video-owner-renderer ytd-channel-name yt-formatted-string",
+    "#owner ytd-channel-name a",
+    "#channel-name a",
+    "ytd-channel-name yt-formatted-string a",
+  ];
+  let channel = null;
+  for (const sel of channelSelectors) {
+    const el = document.querySelector(sel);
+    if (el && el.textContent.trim()) {
+      channel = el.textContent.trim();
+      break;
+    }
+  }
+
+  return { title, channel };
 }
 
 // ── Impression tracking with IntersectionObserver ──────────────────────────
@@ -78,20 +161,15 @@ const observer = new IntersectionObserver(
       if (!data) return;
 
       if (entry.isIntersecting) {
-        // Video entered viewport
         if (!pendingImpressions.has(data.videoId)) {
-          pendingImpressions.set(data.videoId, {
-            ...data,
-            visibleSince: now,
-          });
+          pendingImpressions.set(data.videoId, { ...data, visibleSince: now });
         }
       } else {
-        // Video left viewport — check if it was visible long enough
         const pending = pendingImpressions.get(data.videoId);
         if (pending) {
           const visibleMs = now - pending.visibleSince;
           if (visibleMs >= IMPRESSION_THRESHOLD_MS && !sentImpressions.has(data.videoId)) {
-            queueEvent("impression", data);
+            queueEvent("impression", pending);
             sentImpressions.add(data.videoId);
           }
           pendingImpressions.delete(data.videoId);
@@ -99,14 +177,15 @@ const observer = new IntersectionObserver(
       }
     });
   },
-  { threshold: 0.5 } // 50% of the card must be visible
+  { threshold: 0.5 }
 );
 
 function observeVideoCards() {
   const selectors = [
-    "ytd-rich-item-renderer",       // homepage feed
-    "ytd-compact-video-renderer",   // watch page sidebar
-    "ytd-video-renderer",           // search results
+    "ytd-rich-item-renderer",
+    "ytd-compact-video-renderer",
+    "ytd-video-renderer",
+    "ytd-reel-item-renderer",
   ];
   selectors.forEach((sel) => {
     document.querySelectorAll(sel).forEach((card) => {
@@ -126,9 +205,8 @@ function checkWatchPage() {
   const videoId = match ? match[1] : null;
 
   if (videoId && videoId !== currentWatchVideoId) {
-    // User navigated to a new video — record the click
+    // End previous watch
     if (currentWatchVideoId && watchStartTime) {
-      // End previous watch session
       const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
       queueEvent("watch_end", {
         videoId: currentWatchVideoId,
@@ -139,21 +217,33 @@ function checkWatchPage() {
     currentWatchVideoId = videoId;
     watchStartTime = Date.now();
 
-    // Extract title from the watch page
-    const titleEl = document.querySelector(
-      "yt-formatted-string.ytd-watch-metadata, h1.ytd-watch-metadata yt-formatted-string"
-    );
-    const channelEl = document.querySelector(
-      "ytd-channel-name yt-formatted-string a, ytd-video-owner-renderer ytd-channel-name a"
-    );
-
+    // Queue click immediately with whatever info is available now
+    const info = extractWatchPageInfo();
     queueEvent("click", {
       videoId,
-      title: titleEl ? titleEl.textContent.trim() : null,
-      channel: channelEl ? channelEl.textContent.trim() : null,
+      title: info.title,
+      channel: info.channel,
     });
+
+    // YouTube SPA: title often isn't rendered yet. Retry a few times.
+    if (!info.title) {
+      const retryDelays = [500, 1500, 3000, 5000];
+      retryDelays.forEach((delay) => {
+        setTimeout(() => {
+          if (currentWatchVideoId !== videoId) return; // navigated away
+          const retry = extractWatchPageInfo();
+          if (retry.title) {
+            // Update the click event with the title
+            queueEvent("click", {
+              videoId,
+              title: retry.title,
+              channel: retry.channel || info.channel,
+            });
+          }
+        }, delay);
+      });
+    }
   } else if (!videoId && currentWatchVideoId) {
-    // Left watch page
     const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
     queueEvent("watch_end", {
       videoId: currentWatchVideoId,
@@ -174,10 +264,11 @@ function queueEvent(type, data) {
     url: window.location.href,
     ...data,
   });
+  console.debug("[TwinTube]", type, data.title || data.videoId);
 }
 
 async function flushEvents() {
-  // Also flush any currently-visible impressions that have been visible long enough
+  // Flush visible impressions that have been on screen long enough
   const now = Date.now();
   pendingImpressions.forEach((pending, videoId) => {
     if (
@@ -200,23 +291,31 @@ async function flushEvents() {
 
   const batch = eventQueue.splice(0);
   try {
-    await fetch(`${BACKEND_URL}/api/events`, {
+    const resp = await fetch(`${BACKEND_URL}/api/events`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ events: batch }),
     });
+    if (!resp.ok) {
+      console.warn("[TwinTube] Send failed:", resp.status);
+      eventQueue.unshift(...batch);
+    }
   } catch (err) {
-    // Put events back if send failed
     eventQueue.unshift(...batch);
     console.debug("[TwinTube] Send failed, will retry:", err.message);
   }
 }
 
-// ── MutationObserver to catch dynamically-loaded video cards ───────────────
+// ── MutationObserver for dynamic content ───────────────────────────────────
 
+let mutationTimer = null;
 const domObserver = new MutationObserver(() => {
-  observeVideoCards();
-  checkWatchPage();
+  // Debounce: YouTube fires many mutations during navigation
+  if (mutationTimer) clearTimeout(mutationTimer);
+  mutationTimer = setTimeout(() => {
+    observeVideoCards();
+    checkWatchPage();
+  }, 300);
 });
 
 // ── Init ───────────────────────────────────────────────────────────────────
@@ -227,33 +326,33 @@ function init() {
   observeVideoCards();
   checkWatchPage();
 
-  // Watch for new video cards added to the DOM (infinite scroll, navigation)
   domObserver.observe(document.body, { childList: true, subtree: true });
 
-  // Batch-send events periodically
   setInterval(flushEvents, SEND_INTERVAL_MS);
 
   // Flush on page unload
   window.addEventListener("beforeunload", () => {
     if (currentWatchVideoId && watchStartTime) {
       const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
-      queueEvent("watch_end", {
-        videoId: currentWatchVideoId,
-        watchDurationSec,
-      });
+      queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec });
     }
-    flushEvents();
+    // Use sendBeacon for reliability on unload
+    if (eventQueue.length > 0) {
+      navigator.sendBeacon(
+        `${BACKEND_URL}/api/events`,
+        new Blob([JSON.stringify({ events: eventQueue })], { type: "application/json" })
+      );
+      eventQueue = [];
+    }
   });
 
-  // YouTube uses History API for navigation (SPA), so listen for URL changes
+  // Listen for YouTube SPA navigation via title changes
   let lastUrl = location.href;
   new MutationObserver(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
-      // Reset impression tracking for new page
       sentImpressions.clear();
       pendingImpressions.clear();
-      // Re-scan after YouTube renders new content
       setTimeout(() => {
         observeVideoCards();
         checkWatchPage();
@@ -262,7 +361,6 @@ function init() {
   }).observe(document.querySelector("title"), { childList: true });
 }
 
-// YouTube might not be fully loaded yet
 if (document.readyState === "loading") {
   document.addEventListener("DOMContentLoaded", init);
 } else {
