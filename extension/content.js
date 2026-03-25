@@ -3,7 +3,7 @@
  *
  * Tracks:
  *   1. Impressions: videos visible in the user's viewport
- *   2. Clicks: videos the user navigates to watch
+ *   2. Clicks: videos the user navigates to watch (one per video, with title)
  *   3. Watch duration: how long the user watches each video
  */
 
@@ -16,28 +16,27 @@ const SESSION_ID = `session_${Date.now()}_${Math.random().toString(36).slice(2, 
 
 const pendingImpressions = new Map();
 const sentImpressions = new Set();
+const sentClicks = new Set(); // prevent duplicate click events per video
 let eventQueue = [];
 let currentWatchVideoId = null;
 let watchStartTime = null;
+let lastCheckedUrl = null; // for URL-change detection outside debounce
 
 // ── Video extraction from DOM ──────────────────────────────────────────────
 
 function extractVideoFromCard(card) {
-  // Try multiple selectors for the title — YouTube changes these across redesigns
   let title = null;
   let titleEl = card.querySelector("#video-title");
   if (titleEl) {
     title = titleEl.getAttribute("title") || titleEl.textContent || "";
   }
   if (!title || title.trim().length < 3) {
-    // Fallback: look for any <a> with a title attribute containing video info
     const titleLink = card.querySelector("a[title]");
     if (titleLink) {
       title = titleLink.getAttribute("title") || "";
     }
   }
   if (!title || title.trim().length < 3) {
-    // Fallback: yt-formatted-string inside a title container
     const ytStr = card.querySelector("yt-formatted-string#video-title, h3 a, h3 yt-formatted-string");
     if (ytStr) {
       title = ytStr.textContent || "";
@@ -52,41 +51,29 @@ function extractVideoFromCard(card) {
   for (const link of links) {
     const href = link.getAttribute("href") || "";
     const match = href.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
-    if (match) {
-      videoId = match[1];
-      break;
-    }
-    // Also handle /shorts/
+    if (match) { videoId = match[1]; break; }
     const shortsMatch = href.match(/\/shorts\/([a-zA-Z0-9_-]{11})/);
-    if (shortsMatch) {
-      videoId = shortsMatch[1];
-      break;
-    }
+    if (shortsMatch) { videoId = shortsMatch[1]; break; }
   }
   if (!videoId) return null;
 
-  // Channel — try several selectors
+  // Channel
   let channel = null;
-  const channelSelectors = [
+  for (const sel of [
     "ytd-channel-name a",
     "ytd-channel-name yt-formatted-string",
     "#channel-name a",
     "#channel-name yt-formatted-string",
     ".ytd-channel-name",
-  ];
-  for (const sel of channelSelectors) {
+  ]) {
     const el = card.querySelector(sel);
-    if (el && el.textContent.trim()) {
-      channel = el.textContent.trim();
-      break;
-    }
+    if (el && el.textContent.trim()) { channel = el.textContent.trim(); break; }
   }
 
   // Views + posted time
   let views = null;
   let postedAgo = null;
-  const metaSpans = card.querySelectorAll("#metadata-line span, .inline-metadata-item");
-  metaSpans.forEach((span) => {
+  card.querySelectorAll("#metadata-line span, .inline-metadata-item").forEach((span) => {
     const txt = span.textContent.trim();
     if (/views?/i.test(txt) && !views) views = txt;
     else if (/ago|streamed|premiered/i.test(txt) && !postedAgo) postedAgo = txt;
@@ -94,26 +81,21 @@ function extractVideoFromCard(card) {
 
   // Duration
   let duration = null;
-  const durSelectors = [
+  for (const sel of [
     "ytd-thumbnail-overlay-time-status-renderer span",
     "badge-shape .badge-shape-wiz__text",
     "#time-status span",
-  ];
-  for (const sel of durSelectors) {
+  ]) {
     const el = card.querySelector(sel);
-    if (el && el.textContent.trim()) {
-      duration = el.textContent.trim();
-      break;
-    }
+    if (el && el.textContent.trim()) { duration = el.textContent.trim(); break; }
   }
 
   return { videoId, title, channel, views, duration, postedAgo };
 }
 
-// ── Watch page title extraction with retry ─────────────────────────────────
+// ── Watch page title extraction ─────────────────────────────────────────────
 
 function extractWatchPageInfo() {
-  // Try multiple selectors for the watch page title
   const titleSelectors = [
     "h1.ytd-watch-metadata yt-formatted-string",
     "yt-formatted-string.ytd-watch-metadata",
@@ -199,59 +181,80 @@ function observeVideoCards() {
 
 // ── Click / watch tracking ─────────────────────────────────────────────────
 
-function checkWatchPage() {
+/**
+ * Immediately detect URL changes for watch tracking.
+ * Called on every mutation (NOT debounced) so we never miss a navigation.
+ */
+function checkUrlChange() {
   const url = window.location.href;
+  if (url === lastCheckedUrl) return;
+  lastCheckedUrl = url;
+
   const match = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
   const videoId = match ? match[1] : null;
 
   if (videoId && videoId !== currentWatchVideoId) {
-    // End previous watch
+    // ── End previous watch ──
     if (currentWatchVideoId && watchStartTime) {
       const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
-      queueEvent("watch_end", {
-        videoId: currentWatchVideoId,
-        watchDurationSec,
-      });
+      if (watchDurationSec > 0) {
+        queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec });
+      }
     }
 
+    // ── Start new watch ──
     currentWatchVideoId = videoId;
     watchStartTime = Date.now();
 
-    // Queue click immediately with whatever info is available now
-    const info = extractWatchPageInfo();
-    queueEvent("click", {
-      videoId,
-      title: info.title,
-      channel: info.channel,
-    });
+    // Schedule a single click event, retrying until we get the title
+    scheduleClickEvent(videoId);
 
-    // YouTube SPA: title often isn't rendered yet. Retry a few times.
-    if (!info.title) {
-      const retryDelays = [500, 1500, 3000, 5000];
-      retryDelays.forEach((delay) => {
-        setTimeout(() => {
-          if (currentWatchVideoId !== videoId) return; // navigated away
-          const retry = extractWatchPageInfo();
-          if (retry.title) {
-            // Update the click event with the title
-            queueEvent("click", {
-              videoId,
-              title: retry.title,
-              channel: retry.channel || info.channel,
-            });
-          }
-        }, delay);
-      });
-    }
   } else if (!videoId && currentWatchVideoId) {
+    // ── Left watch page (went to home, search, etc.) ──
     const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
-    queueEvent("watch_end", {
-      videoId: currentWatchVideoId,
-      watchDurationSec,
-    });
+    if (watchDurationSec > 0) {
+      queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec });
+    }
     currentWatchVideoId = null;
     watchStartTime = null;
   }
+}
+
+/**
+ * Send exactly ONE click event per video. Retries to capture the title
+ * before sending, but sends with whatever we have after all retries.
+ */
+function scheduleClickEvent(videoId) {
+  if (sentClicks.has(videoId)) return;
+
+  const retryDelays = [0, 400, 1200, 2500, 5000];
+  let attempt = 0;
+
+  function tryClick() {
+    // Navigated away — don't send
+    if (currentWatchVideoId !== videoId) return;
+    // Already sent (e.g., from a parallel retry)
+    if (sentClicks.has(videoId)) return;
+
+    const info = extractWatchPageInfo();
+
+    if (info.title || attempt >= retryDelays.length - 1) {
+      // Send it — we either have the title or have exhausted retries
+      sentClicks.add(videoId);
+      queueEvent("click", {
+        videoId,
+        title: info.title,
+        channel: info.channel,
+      });
+      return;
+    }
+
+    attempt++;
+    setTimeout(tryClick, retryDelays[attempt]);
+  }
+
+  // Start first attempt immediately (delay = 0)
+  tryClick();
 }
 
 // ── Event queue and sending ────────────────────────────────────────────────
@@ -310,11 +313,13 @@ async function flushEvents() {
 
 let mutationTimer = null;
 const domObserver = new MutationObserver(() => {
-  // Debounce: YouTube fires many mutations during navigation
+  // URL check runs on EVERY mutation — never debounced, so we catch navigations instantly
+  checkUrlChange();
+
+  // Card observation is debounced (YouTube fires many mutations)
   if (mutationTimer) clearTimeout(mutationTimer);
   mutationTimer = setTimeout(() => {
     observeVideoCards();
-    checkWatchPage();
   }, 300);
 });
 
@@ -323,20 +328,22 @@ const domObserver = new MutationObserver(() => {
 function init() {
   console.log("[TwinTube] Tracker loaded, session:", SESSION_ID);
 
+  lastCheckedUrl = window.location.href;
   observeVideoCards();
-  checkWatchPage();
+  checkUrlChange();
 
   domObserver.observe(document.body, { childList: true, subtree: true });
 
   setInterval(flushEvents, SEND_INTERVAL_MS);
 
-  // Flush on page unload
+  // Flush on page unload — capture final watch_end
   window.addEventListener("beforeunload", () => {
     if (currentWatchVideoId && watchStartTime) {
       const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
-      queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec });
+      if (watchDurationSec > 0) {
+        queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec });
+      }
     }
-    // Use sendBeacon for reliability on unload
     if (eventQueue.length > 0) {
       navigator.sendBeacon(
         `${BACKEND_URL}/api/events`,
@@ -346,19 +353,32 @@ function init() {
     }
   });
 
-  // Listen for YouTube SPA navigation via title changes
-  let lastUrl = location.href;
-  new MutationObserver(() => {
-    if (location.href !== lastUrl) {
-      lastUrl = location.href;
+  // Also listen for visibilitychange — catches tab switches that YouTube
+  // sometimes uses for SPA navigation without changing the <title>
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      checkUrlChange();
+    }
+  });
+
+  // YouTube SPA navigation via yt-navigate-finish (more reliable than title observer)
+  window.addEventListener("yt-navigate-finish", () => {
+    checkUrlChange();
+    sentImpressions.clear();
+    pendingImpressions.clear();
+    setTimeout(observeVideoCards, 500);
+  });
+
+  // Fallback: title change observer
+  const titleEl = document.querySelector("title");
+  if (titleEl) {
+    new MutationObserver(() => {
+      checkUrlChange();
       sentImpressions.clear();
       pendingImpressions.clear();
-      setTimeout(() => {
-        observeVideoCards();
-        checkWatchPage();
-      }, 1500);
-    }
-  }).observe(document.querySelector("title"), { childList: true });
+      setTimeout(observeVideoCards, 1000);
+    }).observe(titleEl, { childList: true });
+  }
 }
 
 if (document.readyState === "loading") {
