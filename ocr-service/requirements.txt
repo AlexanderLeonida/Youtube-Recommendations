@@ -1,14 +1,20 @@
 opencv-python==4.8.1.78
 pytesseract==0.3.10
-Pillow==10.1.0
+Pillow==10.3.0
 numpy==1.24.3
 mss==9.0.1
 flask==3.0.0
 flask-cors==4.0.0
 requests==2.31.0
+beautifulsoup4==4.12.3
 pymysql==1.1.0
 python-dotenv==1.0.0
 cryptography==41.0.4
+
+# ── RAG pipeline: local Llama + embeddings ──
+llama-cpp-python==0.3.4
+fastembed==0.4.2
+huggingface-hub>=0.25.0
 
 
 

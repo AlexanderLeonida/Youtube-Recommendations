@@ -1,7 +1,8 @@
 import React from "react";
-import { BrowserRouter as Router, Routes, Route, useNavigate } from "react-router-dom";
+import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import Tutorial from "./pages/Tutorial";
 import MainApp from "./pages/MainApp";
+import AdminPage from "./pages/AdminPage";
 
 export default function App() {
   return (
@@ -9,6 +10,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Tutorial />} />
         <Route path="/app" element={<MainApp />} />
+        <Route path="/admin" element={<AdminPage />} />
       </Routes>
     </Router>
   );

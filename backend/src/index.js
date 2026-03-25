@@ -123,6 +123,20 @@ app.get('/api/videos', async (req, res) => {
   }
 });
 
+app.delete('/api/videos/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const response = await axios.delete(`${OCR_SERVICE_URL}/api/videos/${id}`);
+    res.json(response.data);
+  } catch (error) {
+    console.error('Error deleting video:', error.message);
+    res.status(error.response?.status || 500).json(error.response?.data || {
+      error: 'Failed to delete video',
+      details: error.message,
+    });
+  }
+});
+
 app.listen(process.env.PORT || 4000, '0.0.0.0', () => {
   console.log(`Backend server listening on port ${process.env.PORT || 4000}`);
 });

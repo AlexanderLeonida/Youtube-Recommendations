@@ -14,6 +14,12 @@ from collections import Counter
 import os
 import tempfile
 
+try:
+    from hybrid_ocr import hybrid_extract_text_regions, _cpp_available
+    _HAS_HYBRID = _cpp_available()
+except ImportError:
+    _HAS_HYBRID = False
+
 
 class ScreenRecorder:
     def __init__(self, monitor_number: int = 1):
@@ -112,14 +118,13 @@ class YouTubeVideoExtractor:
     def preprocess_image(self, image: np.ndarray) -> np.ndarray:
         """
         Preprocess image for better OCR results.
-        
+
         Args:
             image: Input image (BGR format)
-            
+
         Returns:
             Preprocessed grayscale image
         """
-        # Simpler pipeline that previously gave better character recognition
         height, width = image.shape[:2]
         # Upscale modestly for small inputs
         if max(height, width) < 1500:
@@ -128,17 +133,15 @@ class YouTubeVideoExtractor:
         # Convert to grayscale
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-        # Apply Otsu thresholding to separate text from background
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # Apply denoising (fastNlMeans) as earlier version did
-        denoised = cv2.fastNlMeansDenoising(thresh, None, 10, 7, 21)
-
-        # Enhance contrast using CLAHE
+        # Enhance contrast BEFORE thresholding — CLAHE on grayscale is meaningful;
+        # applying it after binary thresholding (as the old code did) has no effect.
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
+        enhanced = clahe.apply(gray)
 
-        return enhanced
+        # Otsu threshold on contrast-enhanced grayscale
+        _, thresh = cv2.threshold(enhanced, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        return thresh
 
     def _preprocess_for_ocr_variants(self, image: np.ndarray) -> list:
         """Return multiple preprocessing variants (normal + inverted) to improve OCR recall."""
@@ -192,20 +195,32 @@ class YouTubeVideoExtractor:
             print(f"Error detecting text blocks: {e}")
             return []
     
-    def extract_text_regions(self, image: np.ndarray) -> List[Dict]:
+    def extract_text_regions(self, image: np.ndarray, fast: bool = False) -> List[Dict]:
         """
         Extract text regions from image using OCR.
-        Step 3: Filter by confidence and bounding box geometry.
-        
+        Tries the hybrid C++/Python pipeline first for better accuracy;
+        falls back to the pure-Python path if unavailable.
+
         Args:
-            image: Input image
-            
-        Returns:
-            List of text regions with bounding boxes (filtered)
+            image: Input BGR image.
+            fast:  If True, use single-scale OCR only (halves latency).
         """
+        # ── Hybrid C++ pipeline (preferred) ──────────────────────
+        if _HAS_HYBRID:
+            try:
+                regions = hybrid_extract_text_regions(image)
+                if regions:
+                    print(f"[DEBUG] Hybrid pipeline returned {len(regions)} regions")
+                    return regions
+                print("[DEBUG] Hybrid pipeline returned 0 regions, falling back to Python")
+            except Exception as e:
+                print(f"[DEBUG] Hybrid pipeline error: {e}, falling back to Python")
+
+        # ── Pure-Python fallback ─────────────────────────────────
         # Multi-scale OCR -> collect word boxes then merge into line-level regions
         h_img, w_img = image.shape[:2]
-        scales = [1.0, 1.5]
+        # Fast mode uses single scale only (halves OCR time).
+        scales = [1.0] if fast else [1.0, 1.5]
         words = []
 
         for scale in scales:
@@ -216,7 +231,9 @@ class YouTubeVideoExtractor:
                     img = image.copy()
 
                 proc = self.preprocess_image(img)
-                config = '--oem 3 --psm 6'
+                # PSM 11 = sparse text: finds scattered text in grid layouts (YouTube homepage).
+                # PSM 6 (uniform block) was wrong here — it merges unrelated text columns.
+                config = '--oem 3 --psm 11'
                 ocr_data = pytesseract.image_to_data(proc, output_type=pytesseract.Output.DICT, config=config)
             except Exception as e:
                 print(f"pytesseract error (scale={scale}): {e}")
@@ -272,6 +289,28 @@ class YouTubeVideoExtractor:
         if not words:
             return []
 
+        # ---- Deduplicate overlapping word boxes from multi-scale OCR ----
+        # Sort by (y, x) so nearby duplicates are adjacent in the list
+        words = sorted(words, key=lambda r: (r['y'], r['x']))
+        deduped = []
+        for w in words:
+            merged = False
+            for d in deduped:
+                # Same word at roughly the same position? Keep higher conf.
+                if (abs(w['x'] - d['x']) < max(15, d['w'] * 0.5) and
+                    abs(w['y'] - d['y']) < max(10, d['h'] * 0.5) and
+                    (w['text'].lower() == d['text'].lower() or
+                     w['text'].lower() in d['text'].lower() or
+                     d['text'].lower() in w['text'].lower())):
+                    if w['conf'] > d['conf']:
+                        d.update(w)  # replace with higher-confidence version
+                    merged = True
+                    break
+            if not merged:
+                deduped.append(w)
+        words = deduped
+        print(f"[DEBUG] After word dedup: {len(words)} unique words")
+
         # Group words into lines by vertical proximity
         words = sorted(words, key=lambda r: r['y'])
         lines = []
@@ -279,8 +318,10 @@ class YouTubeVideoExtractor:
         cur_y = words[0]['y']
 
         for w in words[1:]:
-            # threshold relative to word height
-            thresh = max(20, int((w['h'] + cur_line[-1]['h']) / 2))
+            # Use 55% of the smaller word height as the vertical grouping threshold.
+            # The old average-height threshold was too loose (e.g. 30px for 30px-tall words),
+            # causing lines from adjacent video-card rows to merge together.
+            thresh = max(8, int(min(w['h'], cur_line[-1]['h']) * 0.55))
             if abs(w['y'] - cur_y) <= thresh:
                 cur_line.append(w)
                 # update cur_y as average
@@ -292,11 +333,35 @@ class YouTubeVideoExtractor:
         if cur_line:
             lines.append(cur_line)
 
-        # Build line regions
+        # Split lines by large horizontal gaps (prevents merging different video card columns)
+        split_lines = []
+        for line in lines:
+            if len(line) <= 1:
+                split_lines.append(line)
+                continue
+            line_sorted_x = sorted(line, key=lambda r: r['x'])
+            avg_w = sum(r['w'] for r in line_sorted_x) / len(line_sorted_x)
+            # Use a tight gap threshold: 2x the average word width, minimum 60px.
+            # YouTube grid cards are ~300px apart; word gaps within a title are <40px.
+            gap_thresh = max(60, avg_w * 2)
+            sub = [line_sorted_x[0]]
+            for j in range(1, len(line_sorted_x)):
+                prev_word = line_sorted_x[j - 1]
+                curr_word = line_sorted_x[j]
+                gap = curr_word['x'] - (prev_word['x'] + prev_word['w'])
+                if gap > gap_thresh:
+                    split_lines.append(sub)
+                    sub = [curr_word]
+                else:
+                    sub.append(curr_word)
+            split_lines.append(sub)
+        lines = split_lines
+
+        # Build line regions (normalize to collapse any remaining adjacent duplicate words)
         text_regions = []
         for line in lines:
             line_sorted = sorted(line, key=lambda r: r['x'])
-            line_text = ' '.join([r['text'] for r in line_sorted])
+            line_text = self._normalize_line_text(' '.join([r['text'] for r in line_sorted]))
             x_min = min(r['x'] for r in line_sorted)
             y_min = min(r['y'] for r in line_sorted)
             x_max = max(r['x'] + r['w'] for r in line_sorted)
@@ -472,6 +537,99 @@ class YouTubeVideoExtractor:
         
         return aggregated
     
+    def _extract_card_fields(self, text_regions: List[Dict], image: np.ndarray) -> Dict:
+        """
+        Extract title, channel, views, and duration from a group of text regions
+        representing a single video card.  Uses YouTube's consistent vertical layout:
+        title (top, larger text) → channel → metadata (views · age) → duration badge.
+        """
+        if not text_regions:
+            return {}
+
+        sorted_regions = sorted(text_regions, key=lambda r: r['y'])
+
+        view_pat = re.compile(r'[\d,\.]+\s*[KMBkmb]?\s*views?', re.I)
+        duration_pat = re.compile(r'\b\d{1,2}:\d{2}(?::\d{2})?\b')
+        channel_at_pat = re.compile(r'@\w+')
+        ago_pat = re.compile(r'\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago', re.I)
+        meta_pat = re.compile(r'(?:views?|watching|subscribers?|streamed|premiered|ago\b)', re.I)
+
+        title = None
+        channel = None
+        views = None
+        duration = None
+        title_candidates = []
+
+        for r in sorted_regions:
+            text = r.get('text', '').strip()
+            if not text or len(text) < 2:
+                continue
+
+            # --- Duration ---
+            dm = duration_pat.search(text)
+            if dm and not duration:
+                duration = dm.group(0)
+
+            # --- Views ---
+            vm = view_pat.search(text)
+            if vm:
+                if not views:
+                    views = vm.group(0)
+                continue  # view lines are never titles
+
+            # --- Channel handle (@name) ---
+            if channel_at_pat.search(text) and not channel:
+                channel = text
+                continue
+
+            # --- Metadata line (views, ago, etc.) ---
+            if meta_pat.search(text) or ago_pat.search(text):
+                if not views:
+                    vm2 = view_pat.search(text)
+                    if vm2:
+                        views = vm2.group(0)
+                continue
+
+            # --- Skip obvious noise ---
+            if not self._filter_text_by_heuristics(text, strict=False):
+                continue
+
+            # Everything else is a title candidate
+            title_candidates.append(r)
+
+        # Pick the best title: topmost candidate(s)
+        if title_candidates:
+            title_candidates.sort(key=lambda r: r['y'])
+            title = title_candidates[0].get('text', '').strip()
+
+            # Multi-line title: merge a second line if it sits directly below
+            if len(title_candidates) > 1:
+                first_bottom = title_candidates[0]['y'] + title_candidates[0].get('h', 20)
+                second = title_candidates[1]
+                if second['y'] - first_bottom < 30:
+                    title = title + ' ' + second.get('text', '').strip()
+
+        # Infer channel from the first short text below the title region
+        if not channel and title and title_candidates:
+            title_bottom_y = title_candidates[0]['y'] + title_candidates[0].get('h', 20)
+            for r in sorted_regions:
+                ry = r.get('y', 0)
+                text = r.get('text', '').strip()
+                if ry > title_bottom_y and ry < title_bottom_y + 60 and 2 < len(text) < 50:
+                    if not view_pat.search(text) and not ago_pat.search(text):
+                        channel = text
+                        break
+
+        return {
+            'title': title,
+            'channel': channel,
+            'views': views,
+            'duration': duration,
+            'timestamp': datetime.now().isoformat(),
+            'raw_text_regions': len(text_regions),
+            'text_regions': text_regions,
+        }
+
     def _aggregate_field(self, field: str) -> Optional[str]:
         """
         Get the most frequent value for a field across frame history,
@@ -955,8 +1113,6 @@ class YouTubeVideoExtractor:
                     return m.group(0)
 
         return None
-        
-        return None
     
     def extract_video_duration(self, text_regions: List[Dict]) -> Optional[str]:
         """
@@ -979,181 +1135,46 @@ class YouTubeVideoExtractor:
         
         return None
     
-    def extract_video_data(self, image: np.ndarray, enable_temporal_aggregation: bool = True) -> Dict:
+    def extract_video_data(self, image: np.ndarray, enable_temporal_aggregation: bool = True, fast: bool = False) -> Dict:
         """
-        Extract all video data from a YouTube screenshot.
-        Step 1: Crop out browser chrome (ignore top N pixels).
-        Step 5: Support temporal aggregation across frames.
-        
+        Extract raw OCR text from a YouTube screenshot.
+
+        The heavy lifting of *structuring* text into individual videos is now
+        handled downstream by the Llama LLM parser (see llm_parser.py).
+        This method focuses on:
+          1. Cropping browser chrome.
+          2. Running OCR (hybrid C++/Python pipeline).
+          3. Returning all text_regions so the LLM can reason over them.
+
         Args:
-            image: Screenshot image (BGR format)
-            enable_temporal_aggregation: If True, aggregate results across frames
-            
+            image: BGR input image.
+            enable_temporal_aggregation: Unused (kept for API compat).
+            fast: If True, use single-scale OCR for lower latency.
+
         Returns:
-            Dictionary with extracted video information
+            Dictionary with 'text_regions' list and basic metadata.
         """
         # Step 1: Ignore top N pixels (browser chrome)
-        N = 120  # pixels to ignore at top (reduced from 1000 for better detection)
+        N = 120
         height, width = image.shape[:2]
         if height > N:
             cropped_image = image[N:, :]
         else:
             cropped_image = image
 
-        processed = self.preprocess_image(cropped_image)
-        text_regions = self.extract_text_regions(cropped_image)
+        text_regions = self.extract_text_regions(cropped_image, fast=fast)
 
-        print(f"[DEBUG] Extracted {len(text_regions)} text regions")
+        print(f"[extract_video_data] Extracted {len(text_regions)} text regions")
         if text_regions:
-            print(f"[DEBUG] First regions: {[(r['text'][:30], r['conf']) for r in text_regions[:5]]}")
+            for r in text_regions[:8]:
+                print(f"[extract_video_data]   '{r['text'][:50]}' conf={r.get('conf',0):.0f} @ ({r['x']},{r['y']})")
 
-        # Detect candidate text block regions (likely video cards)
-        blocks = self._find_text_block_regions(cropped_image)
-        print(f"[DEBUG] Detected {len(blocks)} text blocks")
-
-        videos = []
-
-        if blocks:
-            # For each detected block, collect lines that intersect the block and extract fields
-            for (bx, by, bw, bh) in blocks:
-                # select regions that overlap block
-                block_lines = []
-                for r in text_regions:
-                    rx, ry, rw, rh = r['x'], r['y'], r['w'], r['h']
-                    # compute intersection
-                    inter_x1 = max(bx, rx)
-                    inter_y1 = max(by, ry)
-                    inter_x2 = min(bx + bw, rx + rw)
-                    inter_y2 = min(by + bh, ry + rh)
-                    if inter_x2 > inter_x1 and inter_y2 > inter_y1:
-                        block_lines.append(r)
-
-                if not block_lines:
-                    continue
-
-                # First, attempt to subgroup lines within this block by vertical gaps
-                groups = self._group_lines_by_vertical_gaps(block_lines)
-                if not groups:
-                    groups = [block_lines]
-
-                for grp in groups:
-                    title = self.extract_video_title(grp, cropped_image)
-                    channel = self.extract_channel_name(grp, cropped_image)
-                    views = self.extract_view_count(grp, cropped_image)
-                    duration = self.extract_video_duration(grp)
-
-                    # If title seems concatenated, attempt intelligent splitting
-                    if title:
-                        parts = self._split_possible_titles(title)
-                        if parts and len(parts) > 1:
-                            for p in parts:
-                                v = {
-                                    'title': p,
-                                    'channel': channel,
-                                    'views': views,
-                                    'duration': duration,
-                                    'timestamp': datetime.now().isoformat(),
-                                    'raw_text_regions': len(grp),
-                                    'text_regions': grp,
-                                    'block_bbox': (bx, by, bw, bh)
-                                }
-                                videos.append(v)
-                            continue
-
-                    # Otherwise add single entry for this grouped region
-                    video_data = {
-                        'title': title,
-                        'channel': channel,
-                        'views': views,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'raw_text_regions': len(grp),
-                        'text_regions': grp,
-                        'block_bbox': (bx, by, bw, bh)
-                    }
-                    videos.append(video_data)
-                else:
-                    video_data = {
-                        'title': title,
-                        'channel': channel,
-                        'views': views,
-                        'duration': duration,
-                        'timestamp': datetime.now().isoformat(),
-                        'raw_text_regions': len(block_lines),
-                        'text_regions': block_lines,
-                        'block_bbox': (bx, by, bw, bh)
-                    }
-
-                    videos.append(video_data)
-
-        # If no blocks detected, fall back to previous single-video extraction
-        if not videos:
-            title = self.extract_video_title(text_regions, cropped_image)
-            channel = self.extract_channel_name(text_regions, cropped_image)
-            views = self.extract_view_count(text_regions, cropped_image)
-            duration = self.extract_video_duration(text_regions)
-
-            if title:
-                parts = self._split_possible_titles(title)
-                if parts:
-                    videos = []
-                    for p in parts:
-                        v = {
-                            'title': p,
-                            'channel': channel,
-                            'views': views,
-                            'duration': duration,
-                            'timestamp': datetime.now().isoformat(),
-                            'raw_text_regions': len(text_regions),
-                            'text_regions': text_regions[:50]
-                        }
-                        videos.append(v)
-
-                    if videos:
-                        result = {'multi': True, 'videos': videos, 'timestamp': datetime.now().isoformat()}
-                        print(f"[DEBUG] Fallback split into {len(videos)} videos")
-                        return result
-
-            # No splitting, return single
-            video_data = {
-                'title': title,
-                'channel': channel,
-                'views': views,
-                'duration': duration,
-                'timestamp': datetime.now().isoformat(),
-                'raw_text_regions': len(text_regions),
-                'text_regions': text_regions[:50]
-            }
-            print(f"[DEBUG] Final: title={video_data['title']}, channel={video_data['channel']}")
-            if enable_temporal_aggregation:
-                return self._aggregate_frame_results(video_data)
-            return video_data
-
-        # Deduplicate/clean videos and return list if multiple
-        # Post-process titles: normalize and remove empty
-        cleaned = []
-        seen_titles = set()
-        for v in videos:
-            t = (v.get('title') or '').strip()
-            if not t:
-                continue
-            # remove duplicates by normalized lowercase title
-            norm = re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9 ]', '', t)).strip().lower()
-            if not norm or norm in seen_titles:
-                continue
-            seen_titles.add(norm)
-            cleaned.append(v)
-
-        if len(cleaned) == 1:
-            # return single dict for compatibility
-            if enable_temporal_aggregation:
-                return self._aggregate_frame_results(cleaned[0])
-            return cleaned[0]
-
-        # Return multi-video payload
-        result = {'multi': True, 'videos': cleaned, 'timestamp': datetime.now().isoformat()}
-        print(f"[DEBUG] Returning {len(cleaned)} video entries from page")
-        return result
+        # Return raw regions — the LLM pipeline in app.py will structure them
+        return {
+            'text_regions': text_regions,
+            'timestamp': datetime.now().isoformat(),
+            'raw_text_regions': len(text_regions),
+        }
 
 
 class YouTubeScreenRecorder:

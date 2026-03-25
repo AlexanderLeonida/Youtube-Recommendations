@@ -20,6 +20,7 @@ import time
 import json
 import logging
 import hashlib
+import platform
 from typing import Dict, List, Optional, Tuple, Union
 from dataclasses import dataclass
 from functools import lru_cache
@@ -58,7 +59,8 @@ class InferenceConfig:
     # Model settings
     model_path: str = './checkpoints/best_model.pt'
     quantized_model_path: str = './checkpoints/quantized_model.pt'
-    use_quantization: bool = True
+    # Disable quantization on ARM64 (Apple Silicon, etc.) as PyTorch quantization doesn't support it
+    use_quantization: bool = platform.machine() not in ('aarch64', 'arm64')
     
     # Hardware
     device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -108,6 +110,13 @@ class ModelQuantizer:
         Returns:
             Quantized model
         """
+        # Check if quantization is supported on this architecture
+        arch = platform.machine()
+        if arch in ('aarch64', 'arm64'):
+            logger.warning(f"INT8 quantization not supported on {arch} architecture. Returning unquantized model.")
+            self.quantized_model = self.original_model
+            return self.quantized_model
+        
         logger.info("Applying INT8 quantization...")
         start_time = time.time()
         

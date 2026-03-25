@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../services/api";
 
 interface VideoData {
@@ -11,9 +12,11 @@ interface VideoData {
 }
 
 export default function MainApp() {
+  const navigate = useNavigate();
   const [status, setStatus] = useState("Checking backend connection...");
   const [isRecording, setIsRecording] = useState(false);
   const [videos, setVideos] = useState<VideoData[]>([]);
+  const sessionStartRef = useRef<number>(Date.now());
   const [isOnYouTube, setIsOnYouTube] = useState(false);
   const [captureInterval, setCaptureInterval] = useState(2000); // ms between captures
   const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -77,12 +80,15 @@ export default function MainApp() {
     };
   }, []);
 
-  // Load videos on mount and periodically
+  // Load videos on mount and periodically — only show videos from this session
   const loadVideos = () => {
     api.getVideos()
       .then(res => {
         if (res.data.videos) {
-          setVideos(res.data.videos);
+          const sessionVideos = res.data.videos.filter(
+            (v: VideoData) => new Date(v.extracted_at).getTime() >= sessionStartRef.current
+          );
+          setVideos(sessionVideos);
         }
       })
       .catch(err => console.error('Error loading videos:', err));
@@ -104,7 +110,18 @@ export default function MainApp() {
 
       mediaStreamRef.current = stream;
       setIsRecording(true);
-      setStatus("Screen recording started! Capturing frames and sending to OCR...");
+      setStatus("Screen recording started! Scraping YouTube for instant results...");
+
+      // Fast path: scrape YouTube HTML immediately for instant video titles
+      // while OCR processes frames in the background
+      api.scrapeYouTube()
+        .then(res => {
+          if (res.data.status === 'success') {
+            setStatus(`Scraped ${res.data.videos_saved} videos instantly. OCR processing frames...`);
+            loadVideos();
+          }
+        })
+        .catch(err => console.log('Scraper unavailable, using OCR only:', err.message));
 
       // Create hidden video element to receive stream
       const video = document.createElement('video');
@@ -200,7 +217,7 @@ export default function MainApp() {
 
   return (
     <div style={{ padding: "20px", maxWidth: "1200px", margin: "0 auto" }}>
-      <h1 style={{ textAlign: "center" }}>YouTube Recommendations Tracker</h1>
+      <h1 style={{ textAlign: "center" }}>TwinTube Vector</h1>
       
       <div style={{ 
         padding: "20px", 
@@ -271,7 +288,7 @@ export default function MainApp() {
             Open YouTube
           </button>
           
-          <button 
+          <button
             onClick={loadVideos}
             style={{
               padding: "10px 20px",
@@ -283,6 +300,20 @@ export default function MainApp() {
             }}
           >
             Refresh Videos
+          </button>
+
+          <button
+            onClick={() => navigate('/admin')}
+            style={{
+              padding: "10px 20px",
+              backgroundColor: "#757575",
+              color: "white",
+              border: "none",
+              borderRadius: "4px",
+              cursor: "pointer"
+            }}
+          >
+            Admin
           </button>
         </div>
       </div>

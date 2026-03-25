@@ -7,6 +7,8 @@ import os
 from dotenv import load_dotenv
 import pymysql
 from screen_recorder import YouTubeScreenRecorder
+from llm_parser import parse_with_llm, check_llm_health
+from youtube_scraper import scrape_youtube_homepage
 import threading
 import time
 from datetime import datetime
@@ -100,155 +102,208 @@ def get_db_connection():
 
 def extract_videos_from_text_regions(video_data: dict) -> List[dict]:
     """
-    Extract valid video titles directly from raw text_regions.
-    This is a fallback when the main extraction produces garbage.
+    Extract structured video data (title, channel, views, duration) from raw
+    text_regions by spatially grouping lines into video-card clusters.
+
+    Approach:
+      1. Collect all text_regions (with x, y, w, h, text, conf).
+      2. Sort by y and cluster into card-groups using vertical gaps.
+      3. Within each group, classify lines as title / channel / metadata.
     """
     import re
     from datetime import datetime
-    
+
     if not isinstance(video_data, dict):
         return []
-    
-    # Get text_regions from single video or multi-video
+
+    # Gather text_regions from single or multi-video payloads
     text_regions = []
     if video_data.get('multi'):
         for v in video_data.get('videos', []):
             text_regions.extend(v.get('text_regions', []))
     else:
         text_regions = video_data.get('text_regions', [])
-    
+
     if not text_regions:
         return []
-    
-    # YouTube UI elements to completely skip
-    ui_skip_patterns = [
-        r'^watch\s*later\s*\d*$', r'^liked\s*videos?\s*$', r'^your\s*videos?\s*$',
-        r'^subscriptions?$', r'^history$', r'^library$', r'^home$',
-        r'^\d+\s*(views?|watching)$', r'^\d+[KMB]?\s*views?$',
-    ]
-    
-    # Prefixes to strip from the beginning of text
-    ui_prefixes = [
-        r'^\d+\)\s*liked\s*videos?\s*[&\s]*',  # "2) Liked videos &"
-        r'^\d+\)\s*watch\s*later\s*[&\s]*',    # "1) Watch later &"
-        r'^\d+\)\s*your\s*videos?\s*[&\s]*',   # "3) Your videos &"
-        r'^watch\s*later\s*\d*\s*[&\s]*',      # "Watch later 49 &"
-        r'^liked\s*videos?\s*[&\s]*',          # "Liked videos &"
-        r'^your\s*videos?\s*[&\s]*',           # "Your videos &"
-        r'^\[\]\s*videos?\s*',                 # "[] videos"
-        r'^[\[\]\(\)\{\}<>&,\.\s\d]+(?=[A-Z])', # Leading garbage before capital letter
-    ]
-    
-    # Navigation words
-    nav_words = {'home', 'gaming', 'music', 'sports', 'shorts', 'subscriptions', 
-                 'live', 'trending', 'explore', 'library', 'history'}
-    
+
+    # ---- Patterns ----
+    view_pat   = re.compile(r'[\d,\.]+\s*[KMBkmb]?\s*views?', re.I)
+    dur_pat    = re.compile(r'\b\d{1,2}:\d{2}(?::\d{2})?\b')
+    ago_pat    = re.compile(r'\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago', re.I)
+    meta_pat   = re.compile(r'(?:views?|watching|subscribers?|streamed|premiered|ago\b|Try\s*now|featured|PG-13|RATED|Sign\s*in)', re.I)
+    channel_at = re.compile(r'@\w+')
+    nav_words  = {'home', 'gaming', 'music', 'sports', 'shorts', 'subscriptions',
+                  'live', 'trending', 'explore', 'library', 'history'}
+
+    # ---- 1. Filter low-quality / navigation regions ----
+    filtered = []
+    for r in text_regions:
+        text = r.get('text', '').strip()
+        conf = r.get('conf', 0)
+        if not text or len(text) < 2:
+            continue
+        if conf < 40:
+            continue
+        # Skip navigation-bar text (many nav keywords)
+        words_lower = text.lower().split()
+        if sum(1 for w in words_lower if w in nav_words) >= 3:
+            continue
+        filtered.append(r)
+
+    if not filtered:
+        return []
+
+    # ---- 2. Group into card clusters: COLUMN then ROW ----
+    # YouTube's homepage is a grid (typically 3-4 columns).  Regions in the
+    # same row but different columns have similar Y but very different X.
+    # Step 2a: Assign each region to a column by clustering X positions.
+    if not filtered:
+        return []
+
+    # Determine column boundaries by looking at X centre-points
+    x_centres = sorted(set(r['x'] + r.get('w', 0) // 2 for r in filtered))
+    # Simple column clustering: walk through sorted X centres and split when
+    # the gap exceeds a threshold (e.g. 25% of image width, or 200px minimum)
+    max_x = max(r['x'] + r.get('w', 0) for r in filtered) if filtered else 1
+    col_gap = max(200, int(max_x * 0.20))
+
+    col_boundaries = [x_centres[0]]
+    for i in range(1, len(x_centres)):
+        if x_centres[i] - x_centres[i - 1] > col_gap:
+            col_boundaries.append(x_centres[i])
+
+    def _assign_column(r):
+        cx = r['x'] + r.get('w', 0) // 2
+        best_col = 0
+        best_dist = abs(cx - col_boundaries[0])
+        for ci, cb in enumerate(col_boundaries):
+            d = abs(cx - cb)
+            if d < best_dist:
+                best_dist = d
+                best_col = ci
+        return best_col
+
+    # Step 2b: Within each column, group by vertical gaps into card clusters
+    from collections import defaultdict
+    col_regions = defaultdict(list)
+    for r in filtered:
+        col_regions[_assign_column(r)].append(r)
+
+    groups: List[List[dict]] = []
+    for col_idx in sorted(col_regions.keys()):
+        col = sorted(col_regions[col_idx], key=lambda r: r['y'])
+        if not col:
+            continue
+        heights = [r.get('h', 20) for r in col]
+        avg_h = sum(heights) / len(heights) if heights else 20
+        gap_thresh = max(40, int(avg_h * 2.0))
+
+        current_group = [col[0]]
+        for prev_r, curr_r in zip(col, col[1:]):
+            gap = curr_r['y'] - (prev_r['y'] + prev_r.get('h', 0))
+            if gap > gap_thresh:
+                groups.append(current_group)
+                current_group = [curr_r]
+            else:
+                current_group.append(curr_r)
+        if current_group:
+            groups.append(current_group)
+
+    # ---- 3. Within each group, extract card fields ----
     videos = []
-    seen_titles = set()
-    
-    for region in text_regions:
-        text = region.get('text', '')
-        conf = region.get('conf', 0)
-        y = region.get('y', 0)
-        
-        # Lower confidence threshold to get more videos
-        if conf < 75:
-            continue
-        
-        # Skip regions at very top (likely nav)
-        if y < 80:
-            continue
-        
-        # Split by colons to separate merged titles
-        parts = re.split(r'\s*:\s*', text)
-        
-        for part in parts:
-            part = part.strip()
-            
-            # Clean up UI prefixes first
-            for prefix_pattern in ui_prefixes:
-                part = re.sub(prefix_pattern, '', part, flags=re.I)
-            part = part.strip()
-            
-            # Clean up other garbage prefixes
-            part = re.sub(r'^[\[\]\(\)\{\}<>&,\.\s]+', '', part)
-            part = re.sub(r'^(soc|sug|via|anNYC|Ms)\s*[,\s]+', '', part, flags=re.I)
-            part = part.strip()
-            
-            # Skip too short or too long
-            if len(part) < 10 or len(part) > 80:
+    seen_titles: set = set()
+
+    for grp in groups:
+        title = None
+        channel = None
+        views = None
+        duration = None
+        title_candidates = []
+
+        for r in sorted(grp, key=lambda r: r['y']):
+            text = r.get('text', '').strip()
+            if not text or len(text) < 2:
                 continue
-            
-            # Skip YouTube UI elements (exact matches)
-            skip = False
-            for pattern in ui_skip_patterns:
-                if re.match(pattern, part, re.I):
-                    skip = True
-                    break
-            if skip:
+
+            # Duration
+            dm = dur_pat.search(text)
+            if dm and not duration:
+                duration = dm.group(0)
+
+            # Views
+            vm = view_pat.search(text)
+            if vm:
+                if not views:
+                    views = vm.group(0)
                 continue
-            
-            # Skip if starts with @ (channel name)
-            if part.startswith('@'):
+
+            # Channel handle
+            if channel_at.search(text) and not channel:
+                channel = text
                 continue
-            
-            # Skip if looks like view count or timestamp embedded
-            if re.search(r'\d+[KMB]?\s*views?\s*\d+\s*(months?|years?|days?|hours?)\s*ago', part, re.I):
+
+            # Metadata line (views, ago, featured, etc.)
+            if meta_pat.search(text) or ago_pat.search(text):
+                if not views:
+                    vm2 = view_pat.search(text)
+                    if vm2:
+                        views = vm2.group(0)
                 continue
-            if re.match(r'^\d+:\d+', part):
-                continue
-            
-            # Skip if contains too many nav words
-            words_lower = part.lower().split()
-            nav_count = sum(1 for w in words_lower if w in nav_words)
-            if nav_count >= 3:  # Relaxed from 2 to 3
-                continue
-            
-            # Skip if mostly channel names (multiple @)
-            if part.count('@') >= 2:
-                continue
-            
-            # Skip garbage patterns
-            words = part.split()
-            if len(words) < 2:  # Relaxed from 3 to 2
-                continue
-            
-            # Count meaningful words (3+ chars, alphanumeric)
+
+            # Skip very short fragments or garbage
+            words = text.split()
             meaningful = [w for w in words if len(w) >= 3 and any(c.isalnum() for c in w)]
             if len(meaningful) < 2:
                 continue
-            
-            # Check for too many single-char words
-            single_char = sum(1 for w in words if len(w) == 1)
-            if len(words) > 0 and single_char / len(words) > 0.35:  # Relaxed from 0.25
+            alpha_count = sum(1 for c in text if c.isalpha())
+            if len(text) > 0 and alpha_count / len(text) < 0.45:
                 continue
-            
-            # Check alpha ratio - must have decent text
-            alpha_count = sum(1 for c in part if c.isalpha())
-            if len(part) > 0 and alpha_count / len(part) < 0.45:  # Relaxed from 0.55
-                continue
-            
-            # Normalize for dedup
-            norm = re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9 ]', '', part)).strip().lower()
-            if not norm or norm in seen_titles:
-                continue
-            if len(norm) < 8:  # Relaxed from 10
-                continue
-            
-            seen_titles.add(norm)
-            
-            video = {
-                'title': part,
-                'channel': None,
-                'views': None,
-                'duration': None,
-                'timestamp': datetime.now().isoformat(),
-                'source': 'text_region_extraction'
-            }
-            videos.append(video)
-            print(f"[TEXT_REGION] Extracted title: {part[:50]}")
-    
-    return videos[:10]  # Limit to 10 videos per frame
+
+            title_candidates.append(r)
+
+        # Pick best title (topmost, merge adjacent lines)
+        if title_candidates:
+            title_candidates.sort(key=lambda r: r['y'])
+            title = title_candidates[0].get('text', '').strip()
+            if len(title_candidates) > 1:
+                first_bottom = title_candidates[0]['y'] + title_candidates[0].get('h', 20)
+                second = title_candidates[1]
+                if second['y'] - first_bottom < 30:
+                    title = title + ' ' + second.get('text', '').strip()
+
+        # Infer channel from first short text below title
+        if not channel and title and title_candidates:
+            t_bottom = title_candidates[0]['y'] + title_candidates[0].get('h', 20)
+            for r in sorted(grp, key=lambda r: r['y']):
+                ry = r.get('y', 0)
+                txt = r.get('text', '').strip()
+                if ry > t_bottom and ry < t_bottom + 60 and 2 < len(txt) < 50:
+                    if not view_pat.search(txt) and not ago_pat.search(txt) and not meta_pat.search(txt):
+                        channel = txt
+                        break
+
+        if not title:
+            continue
+
+        # De-duplicate
+        norm = re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9 ]', '', title)).strip().lower()
+        if not norm or norm in seen_titles or len(norm) < 8:
+            continue
+        seen_titles.add(norm)
+
+        video = {
+            'title': title,
+            'channel': channel,
+            'views': views,
+            'duration': duration,
+            'timestamp': datetime.now().isoformat(),
+            'source': 'text_region_extraction'
+        }
+        videos.append(video)
+        print(f"[TEXT_REGION] Extracted: title='{title[:50]}' ch={channel} views={views} dur={duration}")
+
+    return videos[:10]
 
 
 def is_valid_video_data(video_data: dict) -> bool:
@@ -375,11 +430,13 @@ def save_video_data(video_data: dict):
 def health():
     """Health check endpoint."""
     display_status = 'available' if recorder.recorder.display_available else 'unavailable'
+    llm_info = check_llm_health()
     return jsonify({
         'status': 'ok', 
         'service': 'ocr-screen-recorder',
         'display': display_status,
-        'headless_mode': not recorder.recorder.display_available and ALLOW_HEADLESS_MODE
+        'headless_mode': not recorder.recorder.display_available and ALLOW_HEADLESS_MODE,
+        'llm': llm_info,
     })
 
 
@@ -496,12 +553,41 @@ def capture_frame():
         return jsonify({'error': str(e)}), 500
 
 
+def _llm_background_worker(text_regions):
+    """Run LLM structuring in a background thread so upload-frame returns fast."""
+    try:
+        llm_videos = parse_with_llm(text_regions)
+        for v in llm_videos:
+            vid = {
+                'title': v.get('title'),
+                'channel': v.get('channel'),
+                'views': v.get('views'),
+                'duration': v.get('duration'),
+                'posted_ago': v.get('posted_ago'),
+                'timestamp': datetime.now().isoformat(),
+                'source': 'llm_structured',
+            }
+            ok = save_video_data(vid)
+            print(f"[LLM_BG] save={ok} → {vid.get('title', '')[:50]}")
+    except Exception as e:
+        print(f"[LLM_BG] Error: {e}")
+
+
 @app.route('/api/upload-frame', methods=['POST'])
 def upload_frame():
-    """Accept an uploaded frame (multipart file) or a base64 image in JSON, run OCR, and save results."""
+    """
+    Accept an uploaded frame and extract video data.
+
+    Speed optimisations vs the original implementation:
+      - Uses fast=True OCR (single scale) by default — halves Tesseract time.
+      - Returns heuristic results immediately instead of waiting for LLM.
+      - Kicks off LLM structuring in a background thread (results appear on
+        next frontend refresh, not blocking the current request).
+
+    Pass ?detailed=true to force multi-scale OCR + synchronous LLM.
+    """
     try:
-        # Accept either multipart/form-data file upload with key 'file'
-        # or JSON { "image": "data:image/png;base64,..." }
+        # ── Decode image ──────────────────────────────────────────
         if 'file' in request.files:
             file_bytes = request.files['file'].read()
         else:
@@ -509,7 +595,6 @@ def upload_frame():
             img_b64 = data.get('image')
             if not img_b64:
                 return jsonify({'error': 'No image provided'}), 400
-            # If data URL prefix is included, strip it
             if img_b64.startswith('data:'):
                 img_b64 = img_b64.split(',', 1)[1]
             try:
@@ -517,58 +602,127 @@ def upload_frame():
             except Exception:
                 return jsonify({'error': 'Invalid base64 image'}), 400
 
-        # Decode image bytes to OpenCV BGR image
         nparr = np.frombuffer(file_bytes, np.uint8)
         frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         if frame is None:
             return jsonify({'error': 'Failed to decode image'}), 400
 
-        # Use existing extractor to get video data
-        video_data = recorder.extractor.extract_video_data(frame)
-        print(f"[UPLOAD_FRAME] Extracted video_data: {video_data}")
+        detailed = request.args.get('detailed', 'false').lower() == 'true'
+        fast_ocr = not detailed
 
-        # NEW: Try to extract valid titles from raw text_regions if main extraction fails
-        extracted_videos = extract_videos_from_text_regions(video_data)
-        if extracted_videos:
-            saved_any = 0
-            for v in extracted_videos:
-                ok = save_video_data(v)
-                print(f"[UPLOAD_FRAME] save_video_data returned: {ok} for title={v.get('title')}")
-                if ok:
-                    saved_any += 1
-            if saved_any > 0:
-                return jsonify({'status': 'success', 'videos_saved': saved_any, 'video_data': {'extracted_from_regions': True, 'count': saved_any}})
+        # ── Step 1: Run OCR (fast mode by default) ────────────────
+        video_data = recorder.extractor.extract_video_data(frame, fast=fast_ocr)
+        print(f"[UPLOAD_FRAME] OCR returned type={type(video_data).__name__} fast={fast_ocr}")
 
-        # Support multi-video payloads
-        try:
-            if isinstance(video_data, dict) and video_data.get('multi'):
-                saved_any = 0
+        text_regions = []
+        if isinstance(video_data, dict):
+            if video_data.get('multi'):
                 for v in video_data.get('videos', []):
-                    ok = save_video_data(v)
-                    print(f"[UPLOAD_FRAME] save_video_data returned: {ok} for title={v.get('title')}")
-                    if ok:
-                        saved_any += 1
-                return jsonify({'status': 'success', 'videos_saved': saved_any, 'video_data': video_data})
+                    text_regions.extend(v.get('text_regions', []))
+            else:
+                text_regions = video_data.get('text_regions', [])
 
-            if video_data and video_data.get('title'):
-                saved = save_video_data(video_data)
-                print(f"[UPLOAD_FRAME] save_video_data returned: {saved}")
-                if not saved:
-                    return jsonify({'status': 'error', 'message': 'Failed to save extracted video data', 'video_data': video_data}), 500
-                return jsonify({'status': 'success', 'video_data': video_data})
+        # ── Step 2: Heuristic extraction (instant) ────────────────
+        extracted_videos = extract_videos_from_text_regions(video_data)
+        saved_count = 0
+        if extracted_videos:
+            for v in extracted_videos:
+                if save_video_data(v):
+                    saved_count += 1
 
-            print(f"[UPLOAD_FRAME] No title found in extracted data. video_data keys: {list(video_data.keys()) if isinstance(video_data, dict) else 'N/A'}")
+        # ── Step 3: Kick off LLM structuring in background ────────
+        if text_regions:
+            if detailed:
+                # Synchronous LLM for detailed mode
+                llm_videos = parse_with_llm(text_regions)
+                for v in llm_videos:
+                    vid = {
+                        'title': v.get('title'),
+                        'channel': v.get('channel'),
+                        'views': v.get('views'),
+                        'duration': v.get('duration'),
+                        'posted_ago': v.get('posted_ago'),
+                        'timestamp': datetime.now().isoformat(),
+                        'source': 'llm_structured',
+                    }
+                    if save_video_data(vid):
+                        saved_count += 1
+            else:
+                # Background LLM — don't block the response
+                threading.Thread(
+                    target=_llm_background_worker,
+                    args=(text_regions,),
+                    daemon=True,
+                ).start()
+
+        if saved_count > 0:
             return jsonify({
-                'status': 'no_data',
-                'video_data': video_data,
-                'message': 'No video data extracted from uploaded frame'
+                'status': 'success',
+                'videos_saved': saved_count,
+                'source': 'heuristic',
+                'llm_pending': not detailed and bool(text_regions),
+                'video_data': {'extracted_from_regions': True, 'count': saved_count},
             })
-        except Exception as e:
-            print(f"[UPLOAD_FRAME] Error saving data: {e}")
-            return jsonify({'error': str(e)}), 500
+
+        # ── Step 4: Single-video fallback ─────────────────────────
+        if isinstance(video_data, dict) and video_data.get('title'):
+            if save_video_data(video_data):
+                return jsonify({'status': 'success', 'source': 'single', 'video_data': video_data})
+
+        return jsonify({
+            'status': 'no_data',
+            'message': 'No video data extracted from uploaded frame',
+            'regions_found': len(text_regions),
+            'llm_pending': not detailed and bool(text_regions),
+        })
     except Exception as e:
         print(f"Upload frame error: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/scrape-youtube', methods=['POST'])
+def scrape_youtube():
+    """
+    Fast path: extract video titles directly from YouTube's HTML DOM using
+    BeautifulSoup.  Returns results in <1s vs 5-10s for full OCR + LLM.
+    """
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        cookies = data.get('cookies')  # optional browser cookies for personalized recs
+
+        videos = scrape_youtube_homepage(cookies=cookies)
+        if not videos:
+            return jsonify({'status': 'no_data', 'message': 'Could not scrape YouTube homepage'})
+
+        saved_count = 0
+        for v in videos:
+            vid = {
+                'title': v.get('title'),
+                'channel': v.get('channel'),
+                'views': v.get('views'),
+                'duration': v.get('duration'),
+                'posted_ago': v.get('posted_ago'),
+                'timestamp': v.get('timestamp', datetime.now().isoformat()),
+                'source': 'html_scraper',
+            }
+            if save_video_data(vid):
+                saved_count += 1
+
+        return jsonify({
+            'status': 'success',
+            'videos_saved': saved_count,
+            'videos_found': len(videos),
+            'source': 'html_scraper',
+        })
+    except Exception as e:
+        print(f"[SCRAPER] Endpoint error: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/llm-status', methods=['GET'])
+def llm_status():
+    """Check local Llama model availability."""
+    return jsonify(check_llm_health())
 
 
 @app.route('/api/recording-status', methods=['GET'])
@@ -598,6 +752,26 @@ def get_videos():
         conn.close()
         
         return jsonify({'videos': videos, 'count': len(videos)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/videos/<int:video_id>', methods=['DELETE'])
+def delete_video(video_id):
+    """Delete a specific video by ID."""
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({'error': 'Database connection failed'}), 500
+    try:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM videos WHERE id = %s", (video_id,))
+        conn.commit()
+        affected = cursor.rowcount
+        cursor.close()
+        conn.close()
+        if affected == 0:
+            return jsonify({'error': 'Video not found'}), 404
+        return jsonify({'status': 'deleted', 'id': video_id})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

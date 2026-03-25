@@ -29,11 +29,18 @@ export const api = {
   getVideos: () =>
     axios.get(`${API_BASE_URL}/api/videos`),
 
+  deleteVideo: (id: number) =>
+    axios.delete(`${API_BASE_URL}/api/videos/${id}`),
+
   // OCR service endpoints
   uploadFrameToOCR: (imageBase64: string) =>
     axios.post(`${OCR_API_BASE_URL}/api/upload-frame`, {
       image: imageBase64,
     }),
+
+  // Fast path: scrape YouTube HTML directly with BeautifulSoup (<1s)
+  scrapeYouTube: () =>
+    axios.post(`${OCR_API_BASE_URL}/api/scrape-youtube`, {}),
 
   getOCRHealth: () =>
     axios.get(`${OCR_API_BASE_URL}/health`),
