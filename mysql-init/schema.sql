@@ -37,5 +37,21 @@ CREATE TABLE IF NOT EXISTS video_views (
     FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-
-
+-- Browsing events: impressions, clicks, watch_end from the Chrome extension
+CREATE TABLE IF NOT EXISTS browse_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type ENUM('impression', 'click', 'watch_end') NOT NULL,
+    session_id VARCHAR(100) NOT NULL,
+    video_id VARCHAR(20) NOT NULL,
+    title VARCHAR(500),
+    channel VARCHAR(255),
+    views VARCHAR(100),
+    duration VARCHAR(50),
+    posted_ago VARCHAR(100),
+    watch_duration_sec INT DEFAULT NULL,
+    page_url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_session (session_id),
+    INDEX idx_video (video_id),
+    INDEX idx_type_time (event_type, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

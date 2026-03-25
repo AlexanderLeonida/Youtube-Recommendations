@@ -9,6 +9,14 @@ import pymysql
 from screen_recorder import YouTubeScreenRecorder
 from llm_parser import parse_with_llm, check_llm_health
 from youtube_scraper import scrape_youtube_homepage
+from youtube_api import (
+    get_trending,
+    search_videos,
+    get_related_videos,
+    get_channel_videos,
+    get_videos_by_id,
+    get_category_list,
+)
 import threading
 import time
 from datetime import datetime
@@ -717,6 +725,115 @@ def scrape_youtube():
     except Exception as e:
         print(f"[SCRAPER] Endpoint error: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/trending', methods=['GET'])
+def api_trending():
+    """Fetch trending videos via YouTube Data API.  1 quota unit."""
+    try:
+        region = request.args.get('region', 'US')
+        category = request.args.get('category', '0')
+        max_results = int(request.args.get('max_results', 50))
+
+        videos = get_trending(region_code=region, category_id=category, max_results=max_results)
+        saved = _save_api_videos(videos)
+        return jsonify({'status': 'success', 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/search', methods=['GET'])
+def api_search():
+    """Search YouTube videos.  100 quota units per call."""
+    try:
+        query = request.args.get('q', '')
+        if not query:
+            return jsonify({'error': 'Missing query parameter ?q='}), 400
+        max_results = int(request.args.get('max_results', 25))
+        order = request.args.get('order', 'relevance')
+
+        videos = search_videos(query=query, max_results=max_results, order=order)
+        saved = _save_api_videos(videos)
+        return jsonify({'status': 'success', 'query': query, 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/related', methods=['GET'])
+def api_related():
+    """Get videos related to a given video ID.  100 quota units."""
+    try:
+        video_id = request.args.get('video_id', '')
+        if not video_id:
+            return jsonify({'error': 'Missing ?video_id='}), 400
+        max_results = int(request.args.get('max_results', 25))
+
+        videos = get_related_videos(video_id=video_id, max_results=max_results)
+        saved = _save_api_videos(videos)
+        return jsonify({'status': 'success', 'video_id': video_id, 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/channel', methods=['GET'])
+def api_channel_videos():
+    """Fetch recent videos from a channel.  101 quota units."""
+    try:
+        channel_id = request.args.get('channel_id', '')
+        if not channel_id:
+            return jsonify({'error': 'Missing ?channel_id='}), 400
+        max_results = int(request.args.get('max_results', 50))
+
+        videos = get_channel_videos(channel_id=channel_id, max_results=max_results)
+        saved = _save_api_videos(videos)
+        return jsonify({'status': 'success', 'channel_id': channel_id, 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/videos', methods=['GET'])
+def api_videos_by_id():
+    """Fetch video details by comma-separated IDs.  1 quota unit per 50."""
+    try:
+        ids = request.args.get('ids', '')
+        if not ids:
+            return jsonify({'error': 'Missing ?ids=id1,id2,...'}), 400
+        video_ids = [v.strip() for v in ids.split(',') if v.strip()]
+
+        videos = get_videos_by_id(video_ids)
+        saved = _save_api_videos(videos)
+        return jsonify({'status': 'success', 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/youtube/categories', methods=['GET'])
+def api_categories():
+    """List YouTube video categories.  1 quota unit."""
+    try:
+        region = request.args.get('region', 'US')
+        categories = get_category_list(region_code=region)
+        return jsonify({'status': 'success', 'categories': categories})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _save_api_videos(videos: list) -> int:
+    """Save a list of YouTube API video dicts to the database."""
+    saved = 0
+    for v in videos:
+        vid = {
+            'title': v.get('title'),
+            'channel': v.get('channel'),
+            'views': v.get('views'),
+            'duration': v.get('duration'),
+            'video_id': v.get('video_id'),
+            'timestamp': v.get('timestamp', datetime.now().isoformat()),
+            'source': 'youtube_api',
+        }
+        if save_video_data(vid):
+            saved += 1
+    return saved
 
 
 @app.route('/api/llm-status', methods=['GET'])

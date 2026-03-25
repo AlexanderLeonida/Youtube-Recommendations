@@ -94,6 +94,7 @@ services:
       EMBED_MODEL: BAAI/bge-small-en-v1.5
       LLAMA_N_CTX: "2048"
       LLAMA_N_THREADS: "4"
+      YOUTUBE_API_KEY: ${YOUTUBE_API_KEY:-}
     volumes:
       - llama-models:/app/models
     depends_on:

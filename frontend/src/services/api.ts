@@ -1,29 +1,11 @@
 import axios from 'axios';
 
 const API_BASE_URL =
-  process.env.REACT_APP_API_URL || "http://backend:4000";
-
-const OCR_API_BASE_URL = "http://localhost:5001";
+  process.env.REACT_APP_API_URL || "http://localhost:4000";
 
 export const api = {
   // Health check
   health: () => axios.get(`${API_BASE_URL}/api/health`),
-
-  // Recording endpoints
-  startRecording: (duration?: number, frameInterval?: number) =>
-    axios.post(`${API_BASE_URL}/api/recording/start`, {
-      duration,
-      frame_interval: frameInterval,
-    }),
-
-  stopRecording: () =>
-    axios.post(`${API_BASE_URL}/api/recording/stop`),
-
-  captureFrame: () =>
-    axios.post(`${API_BASE_URL}/api/recording/capture`),
-
-  getRecordingStatus: () =>
-    axios.get(`${API_BASE_URL}/api/recording/status`),
 
   // Video endpoints
   getVideos: () =>
@@ -32,16 +14,15 @@ export const api = {
   deleteVideo: (id: number) =>
     axios.delete(`${API_BASE_URL}/api/videos/${id}`),
 
-  // OCR service endpoints
-  uploadFrameToOCR: (imageBase64: string) =>
-    axios.post(`${OCR_API_BASE_URL}/api/upload-frame`, {
-      image: imageBase64,
+  // Browse events from Chrome extension
+  getEvents: (type?: string, limit?: number) =>
+    axios.get(`${API_BASE_URL}/api/events`, {
+      params: { type, limit: limit || 500 },
     }),
 
-  // Fast path: scrape YouTube HTML directly with BeautifulSoup (<1s)
-  scrapeYouTube: () =>
-    axios.post(`${OCR_API_BASE_URL}/api/scrape-youtube`, {}),
-
-  getOCRHealth: () =>
-    axios.get(`${OCR_API_BASE_URL}/health`),
+  // ML training data: sessions with impressions, clicks, watch times
+  getTrainingData: (limit?: number) =>
+    axios.get(`${API_BASE_URL}/api/training-data`, {
+      params: { limit: limit || 500 },
+    }),
 };

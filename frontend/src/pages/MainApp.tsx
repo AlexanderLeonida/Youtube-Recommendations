@@ -1,6 +1,19 @@
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../services/api";
+
+interface BrowseEvent {
+  id: number;
+  event_type: "impression" | "click" | "watch_end";
+  session_id: string;
+  video_id: string;
+  title: string;
+  channel_name: string;
+  views: string;
+  duration: string;
+  watch_duration_sec: number | null;
+  created_at: string;
+}
 
 interface VideoData {
   id: number;
@@ -14,303 +27,156 @@ interface VideoData {
 export default function MainApp() {
   const navigate = useNavigate();
   const [status, setStatus] = useState("Checking backend connection...");
-  const [isRecording, setIsRecording] = useState(false);
+  const [events, setEvents] = useState<BrowseEvent[]>([]);
   const [videos, setVideos] = useState<VideoData[]>([]);
-  const sessionStartRef = useRef<number>(Date.now());
-  const [isOnYouTube, setIsOnYouTube] = useState(false);
-  const [captureInterval, setCaptureInterval] = useState(2000); // ms between captures
-  const recordingIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const checkIntervalRef = useRef<NodeJS.Timeout | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const screenVideoRef = useRef<HTMLVideoElement | null>(null);
-  const screenCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const captureLoopRef = useRef<NodeJS.Timeout | null>(null);
+  const [activeTab, setActiveTab] = useState<
+    "live" | "clicks" | "impressions" | "videos"
+  >("live");
+  const [stats, setStats] = useState({
+    impressions: 0,
+    clicks: 0,
+    sessions: 0,
+  });
 
-  // Check backend connection with retry logic
+  // Check backend
   useEffect(() => {
-    const checkBackend = async (retries = 5) => {
-      for (let i = 0; i < retries; i++) {
-        try {
-          console.log(`Attempting to connect to backend (attempt ${i + 1}/${retries})...`);
-          const res = await api.health();
-          console.log('Backend response:', res.data);
-          setStatus(res.data.message);
-          return;
-        } catch (error: any) {
-          console.error(`Backend connection attempt ${i + 1} failed:`, error.message);
-          if (i === retries - 1) {
-            const errorMsg = error.response 
-              ? `Backend error: ${error.response.status} ${error.response.statusText}`
-              : error.code === 'ECONNREFUSED'
-              ? 'Backend connection refused. Is it running on port 4000?'
-              : `Could not connect to backend: ${error.message}`;
-            setStatus(errorMsg);
-            console.error('Final connection error:', error);
-          } else {
-            // Wait before retrying (exponential backoff)
-            await new Promise(resolve => setTimeout(resolve, 1000 * (i + 1)));
-          }
-        }
-      }
-    };
-    checkBackend();
+    api
+      .health()
+      .then((res) => setStatus(res.data.message))
+      .catch((err) => setStatus(`Backend error: ${err.message}`));
   }, []);
 
-  // Check if user is on YouTube (kept for reference, but screen recording makes this less critical)
-  useEffect(() => {
-    const checkYouTube = () => {
-      try {
-        const currentUrl = window.location.href;
-        const isYouTube = currentUrl.includes('youtube.com') || 
-                         currentUrl.includes('youtu.be') ||
-                         (window.parent && window.parent.location.href.includes('youtube.com'));
-        setIsOnYouTube(isYouTube);
-      } catch (e) {
-        // Cross-origin restrictions
-      }
-    };
-
-    checkYouTube();
-    checkIntervalRef.current = setInterval(checkYouTube, 2000);
-
-    return () => {
-      if (checkIntervalRef.current) {
-        clearInterval(checkIntervalRef.current);
-      }
-    };
-  }, []);
-
-  // Load videos on mount and periodically — only show videos from this session
-  const loadVideos = () => {
-    api.getVideos()
-      .then(res => {
-        if (res.data.videos) {
-          const sessionVideos = res.data.videos.filter(
-            (v: VideoData) => new Date(v.extracted_at).getTime() >= sessionStartRef.current
-          );
-          setVideos(sessionVideos);
-        }
+  // Poll for events
+  const loadData = () => {
+    api
+      .getEvents(undefined, 200)
+      .then((res) => {
+        const evts = res.data.events || [];
+        setEvents(evts);
+        setStats({
+          impressions: evts.filter(
+            (e: BrowseEvent) => e.event_type === "impression"
+          ).length,
+          clicks: evts.filter((e: BrowseEvent) => e.event_type === "click")
+            .length,
+          sessions: new Set(evts.map((e: BrowseEvent) => e.session_id)).size,
+        });
       })
-      .catch(err => console.error('Error loading videos:', err));
+      .catch(() => {});
+
+    api
+      .getVideos()
+      .then((res) => setVideos(res.data.videos || []))
+      .catch(() => {});
   };
 
   useEffect(() => {
-    loadVideos();
-    const interval = setInterval(loadVideos, 10000); // Refresh every 10 seconds
+    loadData();
+    const interval = setInterval(loadData, 5000);
     return () => clearInterval(interval);
   }, []);
 
-  const startRecording = async () => {
-    try {
-      // Request screen capture permission
-      const stream = await navigator.mediaDevices.getDisplayMedia({
-        video: true,
-        audio: false,
-      } as DisplayMediaStreamOptions);
-
-      mediaStreamRef.current = stream;
-      setIsRecording(true);
-      setStatus("Screen recording started! Scraping YouTube for instant results...");
-
-      // Fast path: scrape YouTube HTML immediately for instant video titles
-      // while OCR processes frames in the background
-      api.scrapeYouTube()
-        .then(res => {
-          if (res.data.status === 'success') {
-            setStatus(`Scraped ${res.data.videos_saved} videos instantly. OCR processing frames...`);
-            loadVideos();
-          }
-        })
-        .catch(err => console.log('Scraper unavailable, using OCR only:', err.message));
-
-      // Create hidden video element to receive stream
-      const video = document.createElement('video');
-      video.srcObject = stream;
-      video.play();
-      screenVideoRef.current = video;
-
-      // Create hidden canvas for frame capture
-      const canvas = document.createElement('canvas');
-      canvas.width = 1920;
-      canvas.height = 1080;
-      screenCanvasRef.current = canvas;
-
-      // Start capturing frames at regular interval
-      captureLoopRef.current = setInterval(async () => {
-        try {
-          if (screenVideoRef.current && screenCanvasRef.current) {
-            const ctx = screenCanvasRef.current.getContext('2d');
-            if (ctx) {
-              // Ensure canvas matches the actual video dimensions for accurate capture
-              const v = screenVideoRef.current as HTMLVideoElement;
-              if (v.videoWidth && v.videoHeight) {
-                screenCanvasRef.current.width = v.videoWidth;
-                screenCanvasRef.current.height = v.videoHeight;
-              }
-              ctx.drawImage(v, 0, 0, screenCanvasRef.current.width, screenCanvasRef.current.height);
-              const imageBase64 = screenCanvasRef.current.toDataURL('image/png');
-              
-              // Send frame to OCR service
-              const response = await api.uploadFrameToOCR(imageBase64);
-              
-              if (response.data.status === 'success' && response.data.video_data) {
-                console.log('OCR extracted:', response.data.video_data);
-                setStatus(`Extracted: ${response.data.video_data.title || 'Processing...'}`);
-                // Refresh videos list
-                loadVideos();
-              }
-            }
-          }
-        } catch (err) {
-          console.error('Error uploading frame to OCR:', err);
-        }
-      }, captureInterval);
-
-      // Handle stream ended (user clicked Stop in the share dialog)
-      stream.getTracks().forEach((track) => {
-        track.onended = () => {
-          stopRecording();
-        };
-      });
-    } catch (err: any) {
-      if (err.name === 'NotAllowedError') {
-        setStatus("Screen capture was cancelled. Please try again.");
-      } else {
-        console.error('Error starting screen recording:', err);
-        setStatus(`Error: ${err.message || 'Could not start screen recording'}`);
-      }
-      setIsRecording(false);
-    }
-  };
-
-  const stopRecording = () => {
-    // Stop all tracks in the media stream
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
-    }
-
-    // Clear capture loop
-    if (captureLoopRef.current) {
-      clearInterval(captureLoopRef.current);
-      captureLoopRef.current = null;
-    }
-
-    // Clean up video and canvas
-    if (screenVideoRef.current) {
-      screenVideoRef.current.srcObject = null;
-      screenVideoRef.current = null;
-    }
-    screenCanvasRef.current = null;
-
-    setIsRecording(false);
-    setStatus("Screen recording stopped.");
-    loadVideos();
-  };
-
-  const handleGoToYouTube = () => {
-    window.open("https://youtube.com", "_blank");
-    // Note: Due to browser security, we can't directly detect when user navigates
-    // to YouTube in a new tab. The user will need to manually start recording
-    // or we can use a browser extension for better integration.
-  };
+  const filteredEvents =
+    activeTab === "clicks"
+      ? events.filter((e) => e.event_type === "click")
+      : activeTab === "impressions"
+        ? events.filter((e) => e.event_type === "impression")
+        : events;
 
   return (
     <div style={{ padding: "20px", maxWidth: "1200px", margin: "0 auto" }}>
       <h1 style={{ textAlign: "center" }}>TwinTube Vector</h1>
-      
-      <div style={{ 
-        padding: "20px", 
-        backgroundColor: "#f5f5f5", 
-        borderRadius: "8px", 
-        marginBottom: "20px" 
-      }}>
-        <p><strong>Status:</strong> {status}</p>
-        <p><strong>Recording:</strong> {isRecording ? "🟢 Active" : "🔴 Inactive"}</p>
-        <p><strong>On YouTube:</strong> {isOnYouTube ? "✅ Yes" : "❌ No"}</p>
+
+      {/* Status + stats */}
+      <div
+        style={{
+          padding: "20px",
+          backgroundColor: "#f5f5f5",
+          borderRadius: "8px",
+          marginBottom: "20px",
+        }}
+      >
         <p>
-          <strong>Capture Interval:</strong> {captureInterval}ms
-          <br />
-          <input 
-            type="range" 
-            min="500" 
-            max="5000" 
-            step="500" 
-            value={captureInterval}
-            onChange={(e) => setCaptureInterval(Number(e.target.value))}
-            disabled={isRecording}
-            style={{ width: "200px" }}
-          />
+          <strong>Status:</strong> {status}
         </p>
-        
-        <div style={{ marginTop: "15px", display: "flex", gap: "10px" }}>
-          <button 
-            onClick={startRecording} 
-            disabled={isRecording}
+
+        <div style={{ display: "flex", gap: "30px", margin: "15px 0" }}>
+          <div>
+            <div style={{ fontSize: "28px", fontWeight: "bold" }}>
+              {stats.impressions}
+            </div>
+            <div style={{ color: "#666" }}>Impressions</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "28px", fontWeight: "bold", color: "#4CAF50" }}>
+              {stats.clicks}
+            </div>
+            <div style={{ color: "#666" }}>Clicks</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "28px", fontWeight: "bold", color: "#2196F3" }}>
+              {stats.sessions}
+            </div>
+            <div style={{ color: "#666" }}>Sessions</div>
+          </div>
+          <div>
+            <div style={{ fontSize: "28px", fontWeight: "bold", color: "#FF9800" }}>
+              {videos.length}
+            </div>
+            <div style={{ color: "#666" }}>Videos in DB</div>
+          </div>
+        </div>
+
+        {events.length === 0 && (
+          <div
             style={{
-              padding: "10px 20px",
-              backgroundColor: isRecording ? "#ccc" : "#4CAF50",
-              color: "white",
-              border: "none",
+              padding: "15px",
+              backgroundColor: "#fff3cd",
               borderRadius: "4px",
-              cursor: isRecording ? "not-allowed" : "pointer"
+              border: "1px solid #ffc107",
+              marginTop: "10px",
             }}
           >
-            Start Screen Recording
-          </button>
-          
-          <button 
-            onClick={stopRecording} 
-            disabled={!isRecording}
-            style={{
-              padding: "10px 20px",
-              backgroundColor: !isRecording ? "#ccc" : "#f44336",
-              color: "white",
-              border: "none",
-              borderRadius: "4px",
-              cursor: !isRecording ? "not-allowed" : "pointer"
-            }}
-          >
-            Stop Recording
-          </button>
-          
-          <button 
-            onClick={handleGoToYouTube}
-            style={{
-              padding: "10px 20px",
-              backgroundColor: "#FF0000",
-              color: "white",
-              border: "none",
-              borderRadius: "4px",
-              cursor: "pointer"
-            }}
-          >
-            Open YouTube
-          </button>
-          
+            <strong>No events yet.</strong> Install the Chrome extension to
+            start tracking:
+            <ol style={{ margin: "8px 0 0 0", paddingLeft: "20px" }}>
+              <li>
+                Open <code>chrome://extensions</code>
+              </li>
+              <li>Enable "Developer mode" (top right)</li>
+              <li>Click "Load unpacked"</li>
+              <li>
+                Select the <code>extension/</code> folder in this project
+              </li>
+              <li>Browse YouTube normally</li>
+            </ol>
+          </div>
+        )}
+
+        {/* Action buttons */}
+        <div style={{ display: "flex", gap: "10px", marginTop: "15px" }}>
           <button
-            onClick={loadVideos}
+            onClick={loadData}
             style={{
               padding: "10px 20px",
               backgroundColor: "#2196F3",
               color: "white",
               border: "none",
               borderRadius: "4px",
-              cursor: "pointer"
+              cursor: "pointer",
             }}
           >
-            Refresh Videos
+            Refresh
           </button>
-
           <button
-            onClick={() => navigate('/admin')}
+            onClick={() => navigate("/admin")}
             style={{
               padding: "10px 20px",
               backgroundColor: "#757575",
               color: "white",
               border: "none",
               borderRadius: "4px",
-              cursor: "pointer"
+              cursor: "pointer",
             }}
           >
             Admin
@@ -318,43 +184,136 @@ export default function MainApp() {
         </div>
       </div>
 
-      <div>
-        <h2>Extracted Videos ({videos.length})</h2>
-        {videos.length === 0 ? (
-          <p>No videos extracted yet. Start recording and navigate to YouTube!</p>
-        ) : (
-          <div style={{ display: "grid", gap: "15px" }}>
-            {videos.map((video) => (
-              <div 
-                key={video.id}
-                style={{
-                  padding: "15px",
-                  backgroundColor: "white",
-                  border: "1px solid #ddd",
-                  borderRadius: "8px",
-                  boxShadow: "0 2px 4px rgba(0,0,0,0.1)"
-                }}
-              >
-                <h3 style={{ margin: "0 0 10px 0", color: "#333" }}>
-                  {video.title || "Unknown Title"}
-                </h3>
-                <p style={{ margin: "5px 0", color: "#666" }}>
-                  <strong>Channel:</strong> {video.channel_name || "Unknown"}
-                </p>
-                <p style={{ margin: "5px 0", color: "#666" }}>
-                  <strong>Views:</strong> {video.view_count || "N/A"}
-                </p>
-                <p style={{ margin: "5px 0", color: "#666" }}>
-                  <strong>Duration:</strong> {video.duration || "N/A"}
-                </p>
-                <p style={{ margin: "5px 0", fontSize: "12px", color: "#999" }}>
-                  Extracted: {new Date(video.extracted_at).toLocaleString()}
-                </p>
-              </div>
-            ))}
-          </div>
-        )}
+      {/* Tabs */}
+      <div style={{ display: "flex", gap: "0", marginBottom: "15px" }}>
+        {(["live", "clicks", "impressions", "videos"] as const).map((tab) => (
+          <button
+            key={tab}
+            onClick={() => setActiveTab(tab)}
+            style={{
+              padding: "8px 20px",
+              backgroundColor: activeTab === tab ? "#333" : "#e0e0e0",
+              color: activeTab === tab ? "white" : "#333",
+              border: "none",
+              cursor: "pointer",
+              borderRadius:
+                tab === "live"
+                  ? "4px 0 0 4px"
+                  : tab === "videos"
+                    ? "0 4px 4px 0"
+                    : "0",
+            }}
+          >
+            {tab === "live"
+              ? "Live Feed"
+              : tab.charAt(0).toUpperCase() + tab.slice(1)}
+          </button>
+        ))}
       </div>
+
+      {/* Events list */}
+      {activeTab !== "videos" ? (
+        <div>
+          <h2>
+            {activeTab === "live"
+              ? "All Events"
+              : activeTab === "clicks"
+                ? "Clicked Videos"
+                : "Impressions"}{" "}
+            ({filteredEvents.length})
+          </h2>
+          {filteredEvents.length === 0 ? (
+            <p>No events yet. Browse YouTube with the extension installed.</p>
+          ) : (
+            <div style={{ display: "grid", gap: "10px" }}>
+              {filteredEvents.map((event) => (
+                <div
+                  key={event.id}
+                  style={{
+                    padding: "12px 15px",
+                    backgroundColor: "white",
+                    border: `2px solid ${
+                      event.event_type === "click"
+                        ? "#4CAF50"
+                        : event.event_type === "watch_end"
+                          ? "#FF9800"
+                          : "#e0e0e0"
+                    }`,
+                    borderRadius: "8px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "15px",
+                  }}
+                >
+                  <span
+                    style={{
+                      padding: "4px 10px",
+                      borderRadius: "12px",
+                      fontSize: "12px",
+                      fontWeight: "bold",
+                      color: "white",
+                      backgroundColor:
+                        event.event_type === "click"
+                          ? "#4CAF50"
+                          : event.event_type === "watch_end"
+                            ? "#FF9800"
+                            : "#9E9E9E",
+                    }}
+                  >
+                    {event.event_type === "watch_end"
+                      ? `watched ${event.watch_duration_sec}s`
+                      : event.event_type}
+                  </span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: "bold" }}>
+                      {event.title || event.video_id}
+                    </div>
+                    <div style={{ color: "#666", fontSize: "13px" }}>
+                      {event.channel_name || ""}
+                      {event.views ? ` \u00B7 ${event.views}` : ""}
+                      {event.duration ? ` \u00B7 ${event.duration}` : ""}
+                    </div>
+                  </div>
+                  <div style={{ color: "#999", fontSize: "12px" }}>
+                    {new Date(event.created_at).toLocaleTimeString()}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      ) : (
+        /* Videos tab */
+        <div>
+          <h2>Videos in Database ({videos.length})</h2>
+          {videos.length === 0 ? (
+            <p>No videos in database yet.</p>
+          ) : (
+            <div style={{ display: "grid", gap: "10px" }}>
+              {videos.map((video) => (
+                <div
+                  key={video.id}
+                  style={{
+                    padding: "12px 15px",
+                    backgroundColor: "white",
+                    border: "1px solid #ddd",
+                    borderRadius: "8px",
+                  }}
+                >
+                  <div style={{ fontWeight: "bold" }}>
+                    {video.title || "Unknown"}
+                  </div>
+                  <div style={{ color: "#666", fontSize: "13px" }}>
+                    {video.channel_name || "Unknown"}{" "}
+                    {video.view_count ? ` \u00B7 ${video.view_count}` : ""}{" "}
+                    {video.duration ? ` \u00B7 ${video.duration}` : ""}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

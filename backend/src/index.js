@@ -137,6 +137,125 @@ app.delete('/api/videos/:id', async (req, res) => {
   }
 });
 
+// ── Browse events from Chrome extension ─────────────────────────────────────
+
+// Create browse_events table if it doesn't exist (in case DB predates schema update)
+db.query(`
+  CREATE TABLE IF NOT EXISTS browse_events (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    event_type ENUM('impression', 'click', 'watch_end') NOT NULL,
+    session_id VARCHAR(100) NOT NULL,
+    video_id VARCHAR(20) NOT NULL,
+    title VARCHAR(500),
+    channel_name VARCHAR(255),
+    views VARCHAR(100),
+    duration VARCHAR(50),
+    posted_ago VARCHAR(100),
+    watch_duration_sec INT DEFAULT NULL,
+    page_url TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_session (session_id),
+    INDEX idx_video (video_id),
+    INDEX idx_type_time (event_type, created_at)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+`, (err) => {
+  if (err) console.error('browse_events table check:', err.message);
+});
+
+app.post('/api/events', (req, res) => {
+  const { events } = req.body;
+  if (!Array.isArray(events) || events.length === 0) {
+    return res.status(400).json({ error: 'No events provided' });
+  }
+
+  const values = events.map((e) => [
+    e.type,
+    e.sessionId,
+    e.videoId,
+    e.title || null,
+    e.channel || null,
+    e.views || null,
+    e.duration || null,
+    e.postedAgo || null,
+    e.watchDurationSec || null,
+    e.url || null,
+  ]);
+
+  const sql = `
+    INSERT INTO browse_events
+      (event_type, session_id, video_id, title, channel_name, views, duration, posted_ago, watch_duration_sec, page_url)
+    VALUES ?
+  `;
+
+  db.query(sql, [values], (err, result) => {
+    if (err) {
+      console.error('Error inserting events:', err.message);
+      return res.status(500).json({ error: err.message });
+    }
+    // Also upsert videos from click/impression events so the videos table stays populated
+    events
+      .filter((e) => e.title && (e.type === 'click' || e.type === 'impression'))
+      .forEach((e) => {
+        db.query(
+          `INSERT INTO videos (title, channel_name, view_count, duration, extracted_at, raw_data)
+           VALUES (?, ?, ?, ?, NOW(), ?)
+           ON DUPLICATE KEY UPDATE view_count = VALUES(view_count), duration = VALUES(duration)`,
+          [e.title, e.channel, e.views, e.duration, JSON.stringify(e)],
+          () => {} // fire and forget
+        );
+      });
+
+    res.json({ status: 'ok', inserted: result.affectedRows });
+  });
+});
+
+// Get browsing events (for dashboard / ML training data export)
+app.get('/api/events', (req, res) => {
+  const type = req.query.type; // optional filter: impression, click, watch_end
+  const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
+
+  let sql = 'SELECT * FROM browse_events';
+  const params = [];
+
+  if (type) {
+    sql += ' WHERE event_type = ?';
+    params.push(type);
+  }
+  sql += ' ORDER BY created_at DESC LIMIT ?';
+  params.push(limit);
+
+  db.query(sql, params, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ events: results, count: results.length });
+  });
+});
+
+// Get training data: pairs of (impressions in a session, what was clicked)
+app.get('/api/training-data', (req, res) => {
+  const sql = `
+    SELECT
+      session_id,
+      GROUP_CONCAT(CASE WHEN event_type = 'impression' THEN video_id END) AS impressions,
+      GROUP_CONCAT(CASE WHEN event_type = 'click' THEN video_id END) AS clicks,
+      GROUP_CONCAT(
+        CASE WHEN event_type = 'watch_end'
+          THEN CONCAT(video_id, ':', watch_duration_sec)
+        END
+      ) AS watch_times
+    FROM browse_events
+    GROUP BY session_id
+    HAVING clicks IS NOT NULL
+    ORDER BY MIN(created_at) DESC
+    LIMIT ?
+  `;
+  const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
+
+  db.query(sql, [limit], (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ sessions: results, count: results.length });
+  });
+});
+
 app.listen(process.env.PORT || 4000, '0.0.0.0', () => {
   console.log(`Backend server listening on port ${process.env.PORT || 4000}`);
 });
