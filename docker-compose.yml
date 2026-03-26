@@ -119,6 +119,7 @@ services:
       USE_GPU_INDEX: "false"
       USE_REDIS_CACHE: "true"
       BACKEND_URL: http://backend:4000
+      OCR_SERVICE_URL: http://ocr-service:5000
     volumes:
       - ./ml:/app
       - /app/__pycache__

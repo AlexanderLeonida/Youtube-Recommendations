@@ -793,8 +793,17 @@ async def recommend_from_history(req: BrowseRecommendRequest):
         per_video_impressions = ctr_data.get("per_video_impressions", {})
         overall_ctr = ctr_data.get("overall_ctr", 0.0)
 
+    # Build the set of ALL video IDs the user has ever been shown (clicked + impressed)
+    all_seen_ids = set(clicked_video_ids)
+    for imp in impressions:
+        vid = imp.get("video_id", "")
+        if vid:
+            all_seen_ids.add(vid)
+
     # Map int IDs back to YouTube IDs with engagement-aware re-scoring
     recommendations = []
+    stale_dropped = 0
+    STALE_IMPRESSION_THRESHOLD = 5  # Drop after this many unclicked impressions
     for int_id, score in zip(result["video_ids"], result["scores"]):
         yt_id = int_to_video.get(int(int_id), "unknown")
         if yt_id == "unknown":
@@ -807,16 +816,21 @@ async def recommend_from_history(req: BrowseRecommendRequest):
         video_ctr = per_video_ctr.get(yt_id, None)
         adjusted_score = float(score)
 
-        # Penalize videos the user has been shown but ignored
+        # Count total times shown without a click
         live_imp_count = impression_counts.get(yt_id, 0)
         hist_imp_count = int(per_video_impressions.get(yt_id, 0))
         total_ignores = live_imp_count + hist_imp_count
+
+        # Drop stale videos entirely — shown too many times with no interest
+        if total_ignores >= STALE_IMPRESSION_THRESHOLD and (video_ctr is None or video_ctr == 0):
+            stale_dropped += 1
+            continue
+
+        # Mild penalty for fewer unclicked impressions
         if total_ignores > 0 and (video_ctr is None or video_ctr == 0):
-            # Never clicked despite being shown — strong suppression
             penalty = min(total_ignores * 0.15, 0.8)
             adjusted_score *= (1.0 - penalty)
         elif video_ctr is not None and video_ctr < overall_ctr * 0.5:
-            # Very low CTR relative to average — mild suppression
             penalty = min((1.0 - video_ctr / max(overall_ctr, 0.01)) * 0.3, 0.5)
             adjusted_score *= (1.0 - penalty)
 
@@ -827,20 +841,107 @@ async def recommend_from_history(req: BrowseRecommendRequest):
             "ctr": video_ctr,
             "impressions_ignored": live_imp_count,
             "youtube_url": f"https://www.youtube.com/watch?v={yt_id}",
+            "source": "model",
         })
 
     # Re-sort by engagement-adjusted score and trim to requested size
     recommendations.sort(key=lambda r: r["score"], reverse=True)
     recommendations = recommendations[:req.top_k]
 
+    # ── Discovery: fill slots freed by stale videos with fresh YouTube API results ──
+    discovery_slots = min(stale_dropped, max(req.top_k // 3, 2))
+    open_slots = req.top_k - len(recommendations)
+    discovery_slots = max(discovery_slots, open_slots)
+    discovery_videos: list = []
+
+    if discovery_slots > 0:
+        # Build search queries from the user's top watched channels
+        channel_counts: Dict[str, int] = {}
+        for c in clicks:
+            ch = c.get("channel_name") or c.get("channel") or ""
+            if ch:
+                channel_counts[ch] = channel_counts.get(ch, 0) + 1
+        top_channels = sorted(channel_counts, key=channel_counts.get, reverse=True)[:3]
+
+        ocr_url = os.getenv("OCR_SERVICE_URL", "http://ocr-service:5000")
+        fetched: List[Dict] = []
+
+        # Strategy 1: search by top channels
+        for ch in top_channels:
+            if len(fetched) >= discovery_slots * 2:
+                break
+            try:
+                sr = http_requests.get(
+                    f"{ocr_url}/api/youtube/search",
+                    params={"q": ch, "max_results": 10},
+                    timeout=8,
+                )
+                if sr.ok:
+                    for v in sr.json().get("videos", []):
+                        if v.get("video_id") and v["video_id"] not in all_seen_ids:
+                            fetched.append(v)
+            except Exception as e:
+                logger.warning(f"YouTube discovery search failed for '{ch}': {e}")
+
+        # Strategy 2: related videos from recent clicks (if not enough)
+        if len(fetched) < discovery_slots:
+            recent_click_ids = [c.get("video_id") for c in clicks[:3] if c.get("video_id")]
+            for vid in recent_click_ids:
+                if len(fetched) >= discovery_slots * 2:
+                    break
+                try:
+                    rr = http_requests.get(
+                        f"{ocr_url}/api/youtube/related",
+                        params={"video_id": vid, "max_results": 10},
+                        timeout=8,
+                    )
+                    if rr.ok:
+                        for v in rr.json().get("videos", []):
+                            if v.get("video_id") and v["video_id"] not in all_seen_ids:
+                                fetched.append(v)
+                except Exception as e:
+                    logger.warning(f"YouTube related-videos failed for '{vid}': {e}")
+
+        # Deduplicate and pick top discovery_slots
+        seen_disc: set = set()
+        for v in fetched:
+            vid = v["video_id"]
+            if vid in seen_disc or vid in all_seen_ids or vid in clicked_video_ids:
+                continue
+            seen_disc.add(vid)
+            # Score by popularity (view count) — higher is better for discovery
+            raw_views = v.get("view_count_raw", 0)
+            disc_score = min(raw_views / 1_000_000, 1.0) * 0.3  # Normalize
+            discovery_videos.append({
+                "video_id": vid,
+                "score": disc_score,
+                "raw_score": 0.0,
+                "ctr": None,
+                "impressions_ignored": 0,
+                "youtube_url": f"https://www.youtube.com/watch?v={vid}",
+                "source": "discovery",
+                "title": v.get("title"),
+                "channel": v.get("channel"),
+                "views": v.get("views"),
+                "duration": v.get("duration"),
+                "thumbnail": v.get("thumbnail"),
+            })
+            if len(discovery_videos) >= discovery_slots:
+                break
+
+    # Merge: model recs first, then discovery fills remaining slots
+    final = recommendations[:req.top_k - len(discovery_videos)] + discovery_videos
+
     return {
-        "recommendations": recommendations,
+        "recommendations": final,
         "history_size": len(watch_history),
         "latency_ms": result["latency_ms"],
         "overall_ctr": overall_ctr,
         "impression_suppressed_count": sum(
-            1 for r in recommendations if r.get("impressions_ignored", 0) > 0
+            1 for r in final if r.get("impressions_ignored", 0) > 0
         ),
+        "stale_dropped": stale_dropped,
+        "discovery_count": len(discovery_videos),
     }
 
 

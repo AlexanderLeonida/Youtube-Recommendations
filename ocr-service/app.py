@@ -754,7 +754,7 @@ def api_search():
 
         videos = search_videos(query=query, max_results=max_results, order=order)
         saved = _save_api_videos(videos)
-        return jsonify({'status': 'success', 'query': query, 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+        return jsonify({'status': 'success', 'query': query, 'videos_found': len(videos), 'videos_saved': saved, 'videos': videos, 'source': 'youtube_api'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -770,7 +770,7 @@ def api_related():
 
         videos = get_related_videos(video_id=video_id, max_results=max_results)
         saved = _save_api_videos(videos)
-        return jsonify({'status': 'success', 'video_id': video_id, 'videos_found': len(videos), 'videos_saved': saved, 'source': 'youtube_api'})
+        return jsonify({'status': 'success', 'video_id': video_id, 'videos_found': len(videos), 'videos_saved': saved, 'videos': videos, 'source': 'youtube_api'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
