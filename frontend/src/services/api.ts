@@ -44,6 +44,12 @@ export const api = {
   getMLHealth: () =>
     axios.get(`${API_BASE_URL}/api/ml/health`),
 
+  evaluateModel: (kValues?: number[], latencyRuns?: number) =>
+    axios.post(`${API_BASE_URL}/api/ml/evaluate`, {
+      k_values: kValues || [5, 10, 20, 50],
+      latency_runs: latencyRuns || 100,
+    }, { timeout: 120000 }),
+
   // Send browse events (used to record recommendation clicks)
   postEvents: (events: Record<string, unknown>[]) =>
     axios.post(`${API_BASE_URL}/api/events`, { events }),

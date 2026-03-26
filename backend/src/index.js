@@ -319,6 +319,17 @@ app.get('/api/ml/train/status', async (req, res) => {
   }
 });
 
+app.post('/api/ml/evaluate', async (req, res) => {
+  try {
+    const response = await axios.post(`${ML_SERVICE_URL}/evaluate`, req.body || {}, { timeout: 120000 });
+    res.json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(
+      error.response?.data || { error: 'ML service unavailable', details: error.message }
+    );
+  }
+});
+
 app.post('/api/ml/recommend', async (req, res) => {
   try {
     const response = await axios.post(`${ML_SERVICE_URL}/recommend_from_history`, req.body || {});

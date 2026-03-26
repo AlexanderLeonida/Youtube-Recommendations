@@ -489,6 +489,11 @@ def train_from_events(
     # 5. Save ID mapper and CTR stats
     id_mapper.save(mapper_path)
 
+    # Save loss history for evaluation dashboard
+    loss_history_path = os.path.join(checkpoint_dir, "loss_history.json")
+    with open(loss_history_path, "w") as f:
+        json.dump(loss_history, f)
+
     ctr_stats_path = os.path.join(checkpoint_dir, "ctr_stats.json")
     with open(ctr_stats_path, "w") as f:
         json.dump({

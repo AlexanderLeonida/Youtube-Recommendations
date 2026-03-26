@@ -413,6 +413,245 @@ async def train_status():
     return result
 
 
+class EvaluateRequest(BaseModel):
+    """Request for model evaluation metrics."""
+    k_values: List[int] = Field(default=[5, 10, 20, 50], description="K values for Recall/NDCG/HitRate")
+    latency_runs: int = Field(default=100, ge=10, le=1000, description="Number of inference runs for latency benchmarking")
+
+
+@app.post("/evaluate")
+async def evaluate_model(req: EvaluateRequest):
+    """
+    Comprehensive model evaluation using leave-one-out on real browse data.
+
+    Metrics computed (standard RecSys evaluation):
+    - Recall@K: fraction of relevant items found in top-K
+    - NDCG@K: normalized discounted cumulative gain (ranking quality)
+    - MRR: mean reciprocal rank of first relevant item
+    - Hit Rate@K: fraction of users with at least one hit in top-K
+    - Coverage: fraction of catalog appearing in recommendations
+    - Latency: P50, P95, P99 inference latency
+    - Training loss curve and CTR stats from saved artifacts
+    """
+    import requests as http_requests
+    import json as _json
+    import math
+
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine not initialized")
+
+    mapper_path = "./checkpoints/id_mapper.json"
+    if not os.path.exists(mapper_path):
+        raise HTTPException(status_code=400, detail="No trained model found. Train first.")
+
+    if not engine.index.is_ready:
+        index_path = os.getenv("INDEX_PATH", "./index/video_embeddings.faiss")
+        if os.path.exists(index_path):
+            try:
+                engine._load_model()
+                engine.index.load(index_path)
+            except Exception:
+                pass
+        if not engine.index.is_ready:
+            raise HTTPException(status_code=400, detail="Model not trained yet.")
+
+    # Load ID mapper
+    with open(mapper_path) as f:
+        mapper_data = _json.load(f)
+    video_to_int = mapper_data["video_to_int"]
+    int_to_video = {int(k): v for k, v in mapper_data["int_to_video"].items()}
+    catalog_size = len(video_to_int)
+
+    # Fetch sessions from backend
+    backend_url = os.getenv("BACKEND_URL", "http://backend:4000")
+    try:
+        resp = http_requests.get(
+            f"{backend_url}/api/training-data", params={"limit": 5000}, timeout=15
+        )
+        resp.raise_for_status()
+        sessions = resp.json().get("sessions", [])
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch training data: {e}")
+
+    if not sessions:
+        raise HTTPException(status_code=400, detail="No browse sessions available for evaluation.")
+
+    # ── Build per-user click sequences ──
+    user_sequences = []
+    for sess in sessions:
+        raw_clicks = sess.get("clicks")
+        raw_watch = sess.get("watch_times")
+        if not raw_clicks:
+            continue
+        clicks = [c.strip() for c in raw_clicks.split(",") if c.strip()]
+        mapped = [video_to_int[c] for c in clicks if c in video_to_int]
+        if len(mapped) < 2:
+            continue
+
+        watch_map = {}
+        if raw_watch:
+            for entry in raw_watch.split(","):
+                entry = entry.strip()
+                if ":" in entry:
+                    parts = entry.rsplit(":", 1)
+                    if len(parts) == 2:
+                        try:
+                            watch_map[parts[0].strip()] = float(parts[1])
+                        except ValueError:
+                            pass
+
+        watch_times = []
+        for c in clicks:
+            if c in video_to_int:
+                watch_times.append(watch_map.get(c, 60.0))
+
+        user_sequences.append({"history": mapped, "watch_times": watch_times})
+
+    if not user_sequences:
+        raise HTTPException(
+            status_code=400,
+            detail="Not enough click sequences (need >=2 clicks per session) for evaluation.",
+        )
+
+    # ── Leave-one-out evaluation ──
+    max_k = max(req.k_values)
+    recall_sums = {k: 0.0 for k in req.k_values}
+    ndcg_sums = {k: 0.0 for k in req.k_values}
+    mrr_sum = 0.0
+    hit_sums = {k: 0 for k in req.k_values}
+    all_recommended: set = set()
+    n_eval = 0
+    latencies: List[float] = []
+
+    for seq in user_sequences:
+        history = seq["history"]
+        watch_times = seq["watch_times"]
+        # Hold out the last click as ground truth
+        ground_truth = history[-1]
+        input_history = history[:-1]
+        input_watch = watch_times[:-1]
+
+        # Pad/truncate to 50
+        max_len = 50
+        if len(input_history) > max_len:
+            input_history = input_history[-max_len:]
+            input_watch = input_watch[-max_len:]
+
+        engagement = [[0.0, 0.0, 0.0]] * len(input_history)
+        user_features = {
+            "watch_history": input_history,
+            "watch_times": input_watch,
+            "engagement": engagement,
+        }
+
+        try:
+            t0 = time.time()
+            result = engine.get_recommendations(user_features, top_k=max_k, use_cache=False)
+            latencies.append((time.time() - t0) * 1000)
+        except Exception:
+            continue
+
+        retrieved = result["video_ids"]
+        all_recommended.update(retrieved)
+        n_eval += 1
+
+        # Find rank of ground truth (1-indexed)
+        rank = None
+        for i, vid in enumerate(retrieved):
+            if vid == ground_truth:
+                rank = i + 1
+                break
+
+        # MRR
+        if rank is not None:
+            mrr_sum += 1.0 / rank
+
+        # Per-K metrics
+        for k in req.k_values:
+            top_k_set = set(retrieved[:k])
+            # Recall@K (binary — 1 relevant item)
+            if ground_truth in top_k_set:
+                recall_sums[k] += 1.0
+                hit_sums[k] += 1
+                # NDCG@K — for single relevant item, NDCG = 1/log2(rank+1) if rank <= K
+                if rank is not None and rank <= k:
+                    ndcg_sums[k] += 1.0 / math.log2(rank + 1)
+
+    if n_eval == 0:
+        raise HTTPException(status_code=400, detail="No valid evaluation sequences.")
+
+    # ── Compile ranking metrics ──
+    recall_at_k = {f"recall@{k}": round(recall_sums[k] / n_eval, 4) for k in req.k_values}
+    ndcg_at_k = {f"ndcg@{k}": round(ndcg_sums[k] / n_eval, 4) for k in req.k_values}
+    hit_rate_at_k = {f"hit_rate@{k}": round(hit_sums[k] / n_eval, 4) for k in req.k_values}
+    mrr = round(mrr_sum / n_eval, 4)
+    coverage = round(len(all_recommended) / max(catalog_size, 1), 4)
+
+    # ── Latency benchmarks (additional runs for stability) ──
+    if len(user_sequences) > 0 and len(latencies) < req.latency_runs:
+        extra_runs = req.latency_runs - len(latencies)
+        for i in range(extra_runs):
+            seq = user_sequences[i % len(user_sequences)]
+            hist = seq["history"][:-1]
+            wt = seq["watch_times"][:-1]
+            if len(hist) > 50:
+                hist = hist[-50:]
+                wt = wt[-50:]
+            uf = {
+                "watch_history": hist,
+                "watch_times": wt,
+                "engagement": [[0.0, 0.0, 0.0]] * len(hist),
+            }
+            try:
+                t0 = time.time()
+                engine.get_recommendations(uf, top_k=20, use_cache=False)
+                latencies.append((time.time() - t0) * 1000)
+            except Exception:
+                pass
+
+    lat_arr = np.array(latencies) if latencies else np.array([0.0])
+    latency_stats = {
+        "p50_ms": round(float(np.percentile(lat_arr, 50)), 3),
+        "p95_ms": round(float(np.percentile(lat_arr, 95)), 3),
+        "p99_ms": round(float(np.percentile(lat_arr, 99)), 3),
+        "mean_ms": round(float(lat_arr.mean()), 3),
+        "num_runs": len(latencies),
+    }
+
+    # ── Training loss curve ──
+    loss_history = []
+    loss_path = "./checkpoints/loss_history.json"
+    if os.path.exists(loss_path):
+        with open(loss_path) as f:
+            loss_history = _json.load(f)
+
+    # ── CTR stats ──
+    ctr_stats = {}
+    ctr_path = "./checkpoints/ctr_stats.json"
+    if os.path.exists(ctr_path):
+        with open(ctr_path) as f:
+            raw = _json.load(f)
+        ctr_stats = {
+            "overall_ctr": raw.get("overall_ctr", 0),
+            "total_impressions": raw.get("total_impressions", 0),
+            "total_clicks": raw.get("total_clicks", 0),
+            "unique_videos": raw.get("unique_videos", 0),
+        }
+
+    return {
+        "recall_at_k": recall_at_k,
+        "ndcg_at_k": ndcg_at_k,
+        "hit_rate_at_k": hit_rate_at_k,
+        "mrr": mrr,
+        "coverage": coverage,
+        "catalog_size": catalog_size,
+        "num_eval_sessions": n_eval,
+        "latency": latency_stats,
+        "loss_history": loss_history,
+        "ctr_stats": ctr_stats,
+    }
+
+
 class BrowseRecommendRequest(BaseModel):
     """Recommend videos based on the user's recent browse history."""
     session_id: Optional[str] = None  # If None, uses all sessions
