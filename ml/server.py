@@ -299,7 +299,6 @@ async def train_model(req: TrainRequest, background_tasks: BackgroundTasks):
         )
         logger.info(f"Training complete: {result}")
         # Reload model after training
-        global engine
         if result.get("status") == "success" and engine is not None:
             try:
                 engine._load_model()
