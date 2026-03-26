@@ -18,11 +18,19 @@ interface BrowseEvent {
 interface Recommendation {
   video_id: string;
   score: number;
+  ctr: number | null;
   youtube_url: string | null;
   title?: string;
   channel?: string;
   views?: string;
   duration?: string;
+}
+
+interface CTRStats {
+  overall_ctr: number;
+  total_impressions: number;
+  total_clicks: number;
+  unique_videos: number;
 }
 
 export default function MainApp() {
@@ -38,6 +46,7 @@ export default function MainApp() {
   const [modelReady, setModelReady] = useState(false);
   const [recommendations, setRecommendations] = useState<Recommendation[]>([]);
   const [isLoadingRecs, setIsLoadingRecs] = useState(false);
+  const [ctrStats, setCtrStats] = useState<CTRStats | null>(null);
 
   // Check backend + ML status
   useEffect(() => {
@@ -46,7 +55,10 @@ export default function MainApp() {
       .catch((err) => setStatus(`Backend error: ${err.message}`));
 
     api.getTrainStatus()
-      .then((res) => setModelReady(res.data.model_exists && res.data.index_exists))
+      .then((res) => {
+        setModelReady(res.data.model_exists && res.data.index_exists);
+        if (res.data.ctr_stats) setCtrStats(res.data.ctr_stats);
+      })
       .catch(() => {});
   }, []);
 
@@ -90,7 +102,11 @@ export default function MainApp() {
           if (s.data.model_exists && s.data.index_exists) {
             setModelReady(true);
             setIsTraining(false);
-            setTrainResult("Training complete! Model is ready.");
+            if (s.data.ctr_stats) setCtrStats(s.data.ctr_stats);
+            const ctrMsg = s.data.ctr_stats
+              ? ` Overall CTR: ${(s.data.ctr_stats.overall_ctr * 100).toFixed(1)}%`
+              : "";
+            setTrainResult(`Training complete! Model is ready.${ctrMsg}`);
             clearInterval(poll);
           }
         } catch {}
@@ -109,6 +125,9 @@ export default function MainApp() {
     try {
       const res = await api.getRecommendations(20);
       setRecommendations(res.data.recommendations || []);
+      if (res.data.overall_ctr != null) {
+        setCtrStats((prev) => prev ? { ...prev, overall_ctr: res.data.overall_ctr } : null);
+      }
     } catch (err: any) {
       const msg = err.response?.data?.detail || err.response?.data?.error || err.message;
       setRecommendations([]);
@@ -143,6 +162,14 @@ export default function MainApp() {
             color={modelReady ? "#4CAF50" : "#FF9800"}
             small
           />
+          {ctrStats && (
+            <StatBox
+              value={`${(ctrStats.overall_ctr * 100).toFixed(1)}%`}
+              label="CTR"
+              color="#9C27B0"
+              small
+            />
+          )}
         </div>
 
         {/* 4 main action buttons */}
@@ -287,8 +314,13 @@ export default function MainApp() {
                         {!rec.title && rec.youtube_url ? " \u00B7 Click to watch" : ""}
                       </div>
                     </div>
-                    <div style={{ color: "#999", fontSize: "12px" }}>
-                      score: {rec.score.toFixed(4)}
+                    <div style={{ color: "#999", fontSize: "12px", textAlign: "right" }}>
+                      <div>score: {rec.score.toFixed(4)}</div>
+                      {rec.ctr != null && (
+                        <div style={{ color: "#9C27B0" }}>
+                          CTR: {(rec.ctr * 100).toFixed(1)}%
+                        </div>
+                      )}
                     </div>
                   </div>
                 </a>

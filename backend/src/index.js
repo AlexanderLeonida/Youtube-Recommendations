@@ -292,9 +292,13 @@ app.get('/api/ml/train/status', async (req, res) => {
     const response = await axios.get(`${ML_SERVICE_URL}/train/status`);
     res.json(response.data);
   } catch (error) {
-    res.status(error.response?.status || 500).json(
-      error.response?.data || { error: 'ML service unavailable' }
-    );
+    // If ML service is down, check local file state as fallback
+    res.json({
+      model_exists: false,
+      id_mapper_exists: false,
+      index_exists: false,
+      error: 'ML service unavailable',
+    });
   }
 });
 
@@ -310,7 +314,11 @@ app.post('/api/ml/recommend', async (req, res) => {
     if (videoIds.length > 0) {
       const placeholders = videoIds.map(() => '?').join(',');
       const sql = `
-        SELECT video_id, title, channel_name, views, duration
+        SELECT video_id,
+               MAX(title) AS title,
+               MAX(channel_name) AS channel_name,
+               MAX(views) AS views,
+               MAX(duration) AS duration
         FROM browse_events
         WHERE video_id IN (${placeholders}) AND title IS NOT NULL
         GROUP BY video_id

@@ -316,16 +316,24 @@ async def train_model(req: TrainRequest, background_tasks: BackgroundTasks):
 
 @app.get("/train/status")
 async def train_status():
-    """Check if a trained model exists."""
+    """Check if a trained model exists and return CTR stats if available."""
     model_path = os.getenv("MODEL_PATH", "./checkpoints/best_model.pt")
     mapper_path = "./checkpoints/id_mapper.json"
     index_path = os.getenv("INDEX_PATH", "./index/video_embeddings.faiss")
+    ctr_stats_path = "./checkpoints/ctr_stats.json"
 
-    return {
+    result = {
         "model_exists": os.path.exists(model_path),
         "id_mapper_exists": os.path.exists(mapper_path),
         "index_exists": os.path.exists(index_path),
     }
+
+    if os.path.exists(ctr_stats_path):
+        import json as _json
+        with open(ctr_stats_path) as f:
+            result["ctr_stats"] = _json.load(f)
+
+    return result
 
 
 class BrowseRecommendRequest(BaseModel):
@@ -347,7 +355,23 @@ async def recommend_from_history(req: BrowseRecommendRequest):
 
     mapper_path = "./checkpoints/id_mapper.json"
     if not os.path.exists(mapper_path):
-        raise HTTPException(status_code=400, detail="No trained model. Train the model first.")
+        raise HTTPException(status_code=400, detail="No trained model. Click 'Train Model' first.")
+
+    if not engine.index.is_ready:
+        # Try to reload index in case training just finished
+        index_path = os.getenv("INDEX_PATH", "./index/video_embeddings.faiss")
+        if os.path.exists(index_path):
+            try:
+                engine._load_model()
+                engine.index.load(index_path)
+                logger.info("Hot-reloaded model and index")
+            except Exception as e:
+                logger.error(f"Failed to reload index: {e}")
+        if not engine.index.is_ready:
+            raise HTTPException(
+                status_code=400,
+                detail="Model not trained yet. Click 'Train Model' to train on your browse data first.",
+            )
 
     # Load ID mapper
     import json
@@ -409,13 +433,25 @@ async def recommend_from_history(req: BrowseRecommendRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Recommendation failed: {e}")
 
+    # Load CTR stats if available
+    ctr_stats_path = "./checkpoints/ctr_stats.json"
+    per_video_ctr = {}
+    overall_ctr = 0.0
+    if os.path.exists(ctr_stats_path):
+        with open(ctr_stats_path) as f:
+            ctr_data = json.load(f)
+        per_video_ctr = ctr_data.get("per_video_ctr", {})
+        overall_ctr = ctr_data.get("overall_ctr", 0.0)
+
     # Map int IDs back to YouTube IDs and titles
     recommendations = []
     for int_id, score in zip(result["video_ids"], result["scores"]):
         yt_id = int_to_video.get(int(int_id), "unknown")
+        video_ctr = per_video_ctr.get(yt_id, None)
         recommendations.append({
             "video_id": yt_id,
             "score": float(score),
+            "ctr": video_ctr,
             "youtube_url": f"https://www.youtube.com/watch?v={yt_id}" if yt_id != "unknown" else None,
         })
 
@@ -423,6 +459,7 @@ async def recommend_from_history(req: BrowseRecommendRequest):
         "recommendations": recommendations,
         "history_size": len(watch_history),
         "latency_ms": result["latency_ms"],
+        "overall_ctr": overall_ctr,
     }
 
 

@@ -386,20 +386,33 @@ class GPUVectorIndex:
         
         logger.info(f"Index loaded from {path}")
     
+    @property
+    def is_ready(self) -> bool:
+        """Check if the index is built and ready for search."""
+        if not FAISS_AVAILABLE:
+            return hasattr(self, 'embeddings') and self.embeddings is not None and self.video_ids is not None
+        return self.index is not None and self.video_ids is not None
+
     def search(self, query_embeddings: np.ndarray, top_k: int = 100) -> Tuple[np.ndarray, np.ndarray]:
         """
         Search for top-k nearest neighbors.
-        
+
         Args:
             query_embeddings: (batch, dim) Query vectors
             top_k: Number of results to return
-            
+
         Returns:
             video_ids: (batch, top_k) Retrieved video IDs
             scores: (batch, top_k) Similarity scores
         """
+        if not self.is_ready:
+            raise RuntimeError(
+                "Vector index is not built. Train the model first (POST /train) "
+                "to build the index before requesting recommendations."
+            )
+
         query_embeddings = query_embeddings.astype(np.float32)
-        
+
         if not FAISS_AVAILABLE:
             # Brute-force fallback
             similarities = np.dot(query_embeddings, self.embeddings.T)
@@ -407,14 +420,14 @@ class GPUVectorIndex:
             scores = np.take_along_axis(similarities, top_k_indices, axis=1)
             video_ids = self.video_ids[top_k_indices]
             return video_ids, scores
-        
+
         # Normalize query
         faiss.normalize_L2(query_embeddings)
-        
+
         # Search
         scores, indices = self.index.search(query_embeddings, top_k)
         video_ids = self.video_ids[indices]
-        
+
         return video_ids, scores
 
 
@@ -452,18 +465,37 @@ class RecommendationEngine:
     def _load_model(self) -> nn.Module:
         """Load and optionally quantize model."""
         from model import create_model
-        
-        # Create model
-        model = create_model(
-            num_videos=self.config.num_videos,
-            embedding_dim=128,
-            output_dim=self.config.embedding_dim
-        )
-        
-        # Load checkpoint if exists
+
+        # Default model config
+        model_kwargs = {
+            "num_videos": self.config.num_videos,
+            "embedding_dim": 128,
+            "output_dim": self.config.embedding_dim,
+        }
+        checkpoint = None
+
         if os.path.exists(self.config.model_path):
             checkpoint = torch.load(self.config.model_path, map_location=self.device)
-            model.load_state_dict(checkpoint['model_state_dict'])
+
+            if "model_config" in checkpoint:
+                # New format: config saved explicitly
+                model_kwargs.update(checkpoint["model_config"])
+                logger.info(f"Using saved model config: {checkpoint['model_config']}")
+            else:
+                # Old format: infer sizes from state_dict shapes
+                sd = checkpoint["model_state_dict"]
+                vid_key = "user_tower.video_embedding.weight"
+                ch_key = "video_tower.channel_embedding.weight"
+                if vid_key in sd:
+                    model_kwargs["num_videos"] = sd[vid_key].shape[0] - 1  # minus padding idx
+                if ch_key in sd:
+                    model_kwargs["num_channels"] = sd[ch_key].shape[0] - 1
+                logger.info(f"Inferred model config from state_dict: num_videos={model_kwargs['num_videos']}")
+
+        model = create_model(**model_kwargs)
+
+        if checkpoint is not None:
+            model.load_state_dict(checkpoint["model_state_dict"])
             logger.info(f"Loaded model from {self.config.model_path}")
         
         # Apply quantization

@@ -118,7 +118,10 @@ services:
       USE_QUANTIZATION: "true"
       USE_GPU_INDEX: "false"
       USE_REDIS_CACHE: "true"
+      BACKEND_URL: http://backend:4000
     volumes:
+      - ./ml:/app
+      - /app/__pycache__
       - ml-models:/app/checkpoints
       - ml-index:/app/index
     depends_on:
