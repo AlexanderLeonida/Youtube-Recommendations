@@ -468,12 +468,30 @@ async def recommend_from_history(req: BrowseRecommendRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch browse history: {e}")
 
+    # Fetch impressions for engagement-aware re-scoring
+    try:
+        imp_params = {"type": "impression", "limit": 500}
+        imp_resp = http_requests.get(f"{backend_url}/api/events", params=imp_params, timeout=10)
+        imp_resp.raise_for_status()
+        impressions = imp_resp.json().get("events", [])
+    except Exception:
+        impressions = []
+
     if not clicks:
         raise HTTPException(status_code=400, detail="No click history found. Browse YouTube first.")
 
     # Filter by session if specified
     if req.session_id:
         clicks = [c for c in clicks if c["session_id"] == req.session_id]
+        impressions = [i for i in impressions if i["session_id"] == req.session_id]
+
+    # Track clicked video IDs and impression counts for re-scoring
+    clicked_video_ids = {c.get("video_id") for c in clicks if c.get("video_id")}
+    impression_counts: Dict[str, int] = {}
+    for imp in impressions:
+        vid = imp.get("video_id", "")
+        if vid and vid not in clicked_video_ids:
+            impression_counts[vid] = impression_counts.get(vid, 0) + 1
 
     # Map to int IDs
     watch_history = []
@@ -506,37 +524,72 @@ async def recommend_from_history(req: BrowseRecommendRequest):
     }
 
     try:
-        result = engine.get_recommendations(user_features, top_k=req.top_k, use_cache=False)
+        # Request extra candidates to compensate for post-filtering
+        fetch_k = req.top_k + len(clicked_video_ids) + len(impression_counts)
+        result = engine.get_recommendations(user_features, top_k=fetch_k, use_cache=False)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Recommendation failed: {e}")
 
-    # Load CTR stats if available
+    # Load CTR and engagement stats
     ctr_stats_path = "./checkpoints/ctr_stats.json"
     per_video_ctr = {}
+    per_video_impressions = {}
     overall_ctr = 0.0
     if os.path.exists(ctr_stats_path):
         with open(ctr_stats_path) as f:
             ctr_data = json.load(f)
         per_video_ctr = ctr_data.get("per_video_ctr", {})
+        per_video_impressions = ctr_data.get("per_video_impressions", {})
         overall_ctr = ctr_data.get("overall_ctr", 0.0)
 
-    # Map int IDs back to YouTube IDs and titles
+    # Map int IDs back to YouTube IDs with engagement-aware re-scoring
     recommendations = []
     for int_id, score in zip(result["video_ids"], result["scores"]):
         yt_id = int_to_video.get(int(int_id), "unknown")
+        if yt_id == "unknown":
+            continue
+
+        # Skip videos the user has already watched
+        if yt_id in clicked_video_ids:
+            continue
+
         video_ctr = per_video_ctr.get(yt_id, None)
+        adjusted_score = float(score)
+
+        # Penalize videos the user has been shown but ignored
+        live_imp_count = impression_counts.get(yt_id, 0)
+        hist_imp_count = int(per_video_impressions.get(yt_id, 0))
+        total_ignores = live_imp_count + hist_imp_count
+        if total_ignores > 0 and (video_ctr is None or video_ctr == 0):
+            # Never clicked despite being shown — strong suppression
+            penalty = min(total_ignores * 0.15, 0.8)
+            adjusted_score *= (1.0 - penalty)
+        elif video_ctr is not None and video_ctr < overall_ctr * 0.5:
+            # Very low CTR relative to average — mild suppression
+            penalty = min((1.0 - video_ctr / max(overall_ctr, 0.01)) * 0.3, 0.5)
+            adjusted_score *= (1.0 - penalty)
+
         recommendations.append({
             "video_id": yt_id,
-            "score": float(score),
+            "score": adjusted_score,
+            "raw_score": float(score),
             "ctr": video_ctr,
-            "youtube_url": f"https://www.youtube.com/watch?v={yt_id}" if yt_id != "unknown" else None,
+            "impressions_ignored": live_imp_count,
+            "youtube_url": f"https://www.youtube.com/watch?v={yt_id}",
         })
+
+    # Re-sort by engagement-adjusted score and trim to requested size
+    recommendations.sort(key=lambda r: r["score"], reverse=True)
+    recommendations = recommendations[:req.top_k]
 
     return {
         "recommendations": recommendations,
         "history_size": len(watch_history),
         "latency_ms": result["latency_ms"],
         "overall_ctr": overall_ctr,
+        "impression_suppressed_count": sum(
+            1 for r in recommendations if r.get("impressions_ignored", 0) > 0
+        ),
     }
 
 

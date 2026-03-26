@@ -139,6 +139,7 @@ class CTRDataset(Dataset):
         # Track global CTR stats per video
         video_impressions: Dict[str, int] = defaultdict(int)
         video_clicks: Dict[str, int] = defaultdict(int)
+        video_watch_times: Dict[str, List[float]] = defaultdict(list)
 
         for sess in sessions:
             clicks = sess.get("clicks", [])
@@ -147,6 +148,7 @@ class CTRDataset(Dataset):
             # Build click history as user context
             clicked_ids = set()
             history: List[int] = []
+            history_watch_times: List[float] = []
             click_meta: Dict[str, Dict] = {}
 
             for click in clicks:
@@ -157,14 +159,20 @@ class CTRDataset(Dataset):
                 int_vid = self.id_mapper.map_video(vid)
                 self.id_mapper.map_channel(click.get("channel_name") or click.get("channel"))
                 history.append(int_vid)
+                history_watch_times.append(float(click.get("watch_duration_sec") or 0))
                 click_meta[vid] = click
                 video_clicks[vid] += 1
+                wd = float(click.get("watch_duration_sec") or 0)
+                if wd > 0:
+                    video_watch_times[vid].append(wd)
 
-            # Count impressions
+            # Count impressions and track per-session counts for weighting
+            session_imp_counts: Dict[str, int] = defaultdict(int)
             for imp in impressions:
                 vid = imp.get("video_id")
                 if vid:
                     video_impressions[vid] += 1
+                    session_imp_counts[vid] += 1
 
             # Also count clicks as impressions (clicked implies seen)
             for vid in clicked_ids:
@@ -173,15 +181,30 @@ class CTRDataset(Dataset):
             if not history:
                 continue
 
-            # ── Positive samples: clicked videos ──
+            # ── Positive samples: clicked videos (watch-time weighted) ──
             for click in clicks:
                 vid = click.get("video_id")
                 if not vid:
                     continue
+
+                # Watch-time weighted label: longer watch = stronger positive
+                watch_dur = float(click.get("watch_duration_sec") or 0)
+                video_dur = _parse_duration_sec(click.get("duration", ""))
+                if watch_dur > 0 and video_dur > 0:
+                    completion = min(watch_dur / video_dur, 1.0)
+                    label = 0.5 + 0.5 * completion
+                elif watch_dur > 0:
+                    # Have watch time but not video duration — time heuristic
+                    label = min(0.5 + 0.5 * (watch_dur / 300), 1.0)
+                else:
+                    label = 0.75  # clicked but no watch data
+
                 self.samples.append(self._make_sample(
                     history=history,
+                    history_watch_times=history_watch_times,
                     event=click,
-                    label=1.0,
+                    label=label,
+                    sample_weight=1.0,
                 ))
 
             # ── Negative samples: impressed but not clicked ──
@@ -191,10 +214,17 @@ class CTRDataset(Dataset):
                     continue
                 self.id_mapper.map_video(vid)
                 self.id_mapper.map_channel(imp.get("channel_name") or imp.get("channel"))
+
+                # More impressions without clicks = stronger negative signal
+                imp_count = session_imp_counts.get(vid, 1)
+                sample_weight = min(1.0 + 0.3 * (imp_count - 1), 3.0)
+
                 self.samples.append(self._make_sample(
                     history=history,
+                    history_watch_times=history_watch_times,
                     event=imp,
                     label=0.0,
+                    sample_weight=sample_weight,
                 ))
 
         # Compute CTR stats
@@ -207,12 +237,20 @@ class CTRDataset(Dataset):
 
         total_impressions = sum(video_impressions.values())
         total_clicks = sum(video_clicks.values())
+        per_video_avg_watch = {
+            vid: sum(times) / len(times)
+            for vid, times in video_watch_times.items()
+            if times
+        }
+
         self.ctr_stats = {
             "total_impressions": total_impressions,
             "total_clicks": total_clicks,
             "overall_ctr": total_clicks / total_impressions if total_impressions > 0 else 0.0,
             "unique_videos": len(all_videos),
             "per_video_ctr": per_video_ctr,
+            "per_video_impressions": dict(video_impressions),
+            "per_video_avg_watch_time": per_video_avg_watch,
         }
 
         n_pos = sum(1 for s in self.samples if s["label"] > 0.5)
@@ -224,10 +262,18 @@ class CTRDataset(Dataset):
             f"Overall CTR: {self.ctr_stats['overall_ctr']:.2%}"
         )
 
-    def _make_sample(self, history: List[int], event: Dict, label: float) -> Dict:
+    def _make_sample(
+        self,
+        history: List[int],
+        history_watch_times: List[float],
+        event: Dict,
+        label: float,
+        sample_weight: float = 1.0,
+    ) -> Dict:
         vid = event.get("video_id", "")
         return {
             "history": list(history[-self.max_history:]),
+            "history_watch_times": list(history_watch_times[-self.max_history:]),
             "target_video": self.id_mapper.map_video(vid),
             "target_channel": self.id_mapper.map_channel(
                 event.get("channel_name") or event.get("channel")
@@ -238,6 +284,7 @@ class CTRDataset(Dataset):
                 0.0, 0.0, 0.0,
             ],
             "watch_dur": float(event.get("watch_duration_sec") or 0),
+            "sample_weight": sample_weight,
             "label": label,
         }
 
@@ -247,23 +294,27 @@ class CTRDataset(Dataset):
     def __getitem__(self, idx):
         s = self.samples[idx]
         h = s["history"]
+        hwt = s["history_watch_times"]
         pad = self.max_history - len(h)
         if pad > 0:
             mask = [1.0] * len(h) + [0.0] * pad
             h = h + [0] * pad
+            hwt = hwt + [0.0] * pad
         else:
             h = h[-self.max_history:]
+            hwt = hwt[-self.max_history:]
             mask = [1.0] * self.max_history
 
         return {
             "watch_history": torch.tensor(h, dtype=torch.long),
             "attention_mask": torch.tensor(mask, dtype=torch.float32),
-            "watch_times": torch.full((self.max_history, 1), s["watch_dur"], dtype=torch.float32),
+            "watch_times": torch.tensor(hwt, dtype=torch.float32).unsqueeze(-1),
             "engagement": torch.zeros(self.max_history, 3),
             "target_video_id": torch.tensor(s["target_video"], dtype=torch.long),
             "target_channel_id": torch.tensor(s["target_channel"], dtype=torch.long),
             "target_numerical": torch.tensor(s["target_numerical"], dtype=torch.float32),
             "label": torch.tensor(s["label"], dtype=torch.float32),
+            "sample_weight": torch.tensor(s["sample_weight"], dtype=torch.float32),
         }
 
 
@@ -403,8 +454,11 @@ def train_from_events(
             logits = (user_emb * video_emb).sum(dim=-1)  # (batch,)
             labels = batch["label"].to(device)            # (batch,)
 
-            # Binary cross-entropy loss for CTR prediction
-            loss = F.binary_cross_entropy_with_logits(logits, labels)
+            # Binary cross-entropy loss, weighted by engagement signals
+            loss = F.binary_cross_entropy_with_logits(
+                logits, labels,
+                weight=batch["sample_weight"].to(device),
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -443,6 +497,8 @@ def train_from_events(
             "total_clicks": dataset.ctr_stats["total_clicks"],
             "unique_videos": dataset.ctr_stats["unique_videos"],
             "per_video_ctr": dataset.ctr_stats["per_video_ctr"],
+            "per_video_impressions": dataset.ctr_stats.get("per_video_impressions", {}),
+            "per_video_avg_watch_time": dataset.ctr_stats.get("per_video_avg_watch_time", {}),
         }, f)
     logger.info(f"CTR stats saved: overall CTR = {dataset.ctr_stats['overall_ctr']:.2%}")
 

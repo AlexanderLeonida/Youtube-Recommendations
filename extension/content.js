@@ -22,6 +22,7 @@ let watchStartTime = null;
 let lastCheckedUrl = null;
 let sidebarScanTimer = null;
 let previousWatchTitle = null;          // title of the video we just left
+let exitFlushed = false;               // guard against duplicate flush on exit
 
 // ── Video card selectors (all page types) ─────────────────────────────────
 
@@ -451,6 +452,34 @@ async function flushEvents() {
   }
 }
 
+// ── Reliable exit flushing ─────────────────────────────────────────────────
+
+/**
+ * Flush current watch state and all queued events via sendBeacon.
+ * Called from visibilitychange:hidden, pagehide, and beforeunload.
+ * Uses a guard flag so only the first one to fire actually sends.
+ */
+function flushOnExit() {
+  if (exitFlushed) return;
+  exitFlushed = true;
+
+  if (currentWatchVideoId && watchStartTime) {
+    const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
+    const title = extractWatchPageTitle();
+    const channel = extractWatchPageChannel();
+    if (watchDurationSec > 0) {
+      queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec, title, channel });
+    }
+  }
+  if (eventQueue.length > 0) {
+    navigator.sendBeacon(
+      `${BACKEND_URL}/api/events`,
+      new Blob([JSON.stringify({ events: eventQueue })], { type: "application/json" })
+    );
+    eventQueue = [];
+  }
+}
+
 // ── MutationObserver for dynamic content ───────────────────────────────────
 
 let mutationTimer = null;
@@ -483,24 +512,11 @@ function init() {
     }
   }, SEND_INTERVAL_MS);
 
-  // Flush on page unload
-  window.addEventListener("beforeunload", () => {
-    if (currentWatchVideoId && watchStartTime) {
-      const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
-      const title = extractWatchPageTitle();
-      const channel = extractWatchPageChannel();
-      if (watchDurationSec > 0) {
-        queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec, title, channel });
-      }
-    }
-    if (eventQueue.length > 0) {
-      navigator.sendBeacon(
-        `${BACKEND_URL}/api/events`,
-        new Blob([JSON.stringify({ events: eventQueue })], { type: "application/json" })
-      );
-      eventQueue = [];
-    }
-  });
+  // Flush watch state on exit — visibilitychange:hidden is the most reliable
+  // "last chance" event across all browsers. pagehide and beforeunload are backups.
+  // The exitFlushed flag ensures only the first handler to fire actually sends.
+  window.addEventListener("pagehide", () => flushOnExit());
+  window.addEventListener("beforeunload", () => flushOnExit());
 
   // yt-navigate-start: capture watch_end BEFORE navigation
   window.addEventListener("yt-navigate-start", () => {
@@ -523,9 +539,13 @@ function init() {
     setTimeout(observeVideoCards, 500);
   });
 
-  // Tab switch
+  // Tab hidden (close, switch, minimize) — most reliable exit event
+  // Tab visible (return) — reset guard and resume tracking
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") {
+    if (document.visibilityState === "hidden") {
+      flushOnExit();
+    } else if (document.visibilityState === "visible") {
+      exitFlushed = false;
       checkUrlChange();
       observeVideoCards();
       scanAndRecordVisibleCards();

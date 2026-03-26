@@ -137,6 +137,12 @@ class ReRankConfig:
     # Minimum score threshold (drop very low-scoring candidates)
     min_score_threshold: float = -float("inf")
 
+    # Engagement-based scoring: boost high-CTR videos, penalize ignored ones
+    engagement_weight: float = 0.15
+
+    # Impression suppression: penalize videos shown many times without clicks
+    impression_penalty_weight: float = 0.2
+
 
 class DiversityReRanker:
     """
@@ -206,12 +212,29 @@ class DiversityReRanker:
         else:
             norm_scores = np.ones_like(scores)
 
-        # Apply freshness boost if metadata available
+        # Apply freshness and engagement boosts if metadata available
         if metadata:
             for i, meta in enumerate(metadata):
                 age_days = meta.get("upload_age_days", 365)
                 recency = max(0.0, 1.0 - age_days / 365.0)
                 norm_scores[i] += cfg.freshness_weight * recency
+
+                # Engagement boost: reward high-CTR videos
+                video_ctr = meta.get("video_ctr")
+                if video_ctr is not None:
+                    norm_scores[i] += cfg.engagement_weight * video_ctr
+
+                # Impression suppression: penalize heavily-shown but unclicked
+                impressions = meta.get("impression_count", 0)
+                clicks = meta.get("click_count", 0)
+                if impressions > 0 and clicks == 0:
+                    penalty = min(impressions * 0.1, 1.0)
+                    norm_scores[i] -= cfg.impression_penalty_weight * penalty
+                elif impressions > 0 and clicks > 0:
+                    # Low CTR relative to impressions — mild penalty
+                    vid_ctr = clicks / impressions
+                    if vid_ctr < 0.05:
+                        norm_scores[i] -= cfg.impression_penalty_weight * (1.0 - vid_ctr / 0.05) * 0.5
 
         # Pre-compute normalized embeddings for cosine similarity
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True).clip(min=1e-8)
