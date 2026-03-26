@@ -137,6 +137,22 @@ app.delete('/api/videos/:id', async (req, res) => {
   }
 });
 
+// ── Debug log from Chrome extension ──────────────────────────────────────────
+let debugLogs = [];
+app.post('/api/debug', (req, res) => {
+  const entry = { timestamp: new Date().toISOString(), ...req.body };
+  debugLogs.push(entry);
+  if (debugLogs.length > 100) debugLogs = debugLogs.slice(-50);
+  res.json({ status: 'ok' });
+});
+app.get('/api/debug', (req, res) => {
+  res.json({ logs: debugLogs });
+});
+app.delete('/api/debug', (req, res) => {
+  debugLogs = [];
+  res.json({ status: 'cleared' });
+});
+
 // ── Browse events from Chrome extension ─────────────────────────────────────
 
 // Create browse_events table if it doesn't exist (in case DB predates schema update)

@@ -27,11 +27,13 @@ let previousWatchTitle = null;          // title of the video we just left
 
 const CARD_SELECTORS = [
   "ytd-rich-item-renderer",          // home feed grid items
-  "ytd-compact-video-renderer",      // sidebar recommendations on watch page
+  "ytd-compact-video-renderer",      // sidebar (legacy)
   "ytd-video-renderer",              // search results
   "ytd-reel-item-renderer",          // shorts shelf
   "ytd-grid-video-renderer",         // channel page grid
   "ytd-playlist-video-renderer",     // playlist items
+  "ytd-playlist-panel-video-renderer", // radio/mix playlist sidebar items
+  "yt-lockup-view-model",            // sidebar recommendations (current YouTube)
 ];
 
 // ── Video extraction from DOM ──────────────────────────────────────────────
@@ -51,7 +53,14 @@ function extractVideoFromCard(card) {
   if (!title || title.trim().length < 3) {
     const ytStr = card.querySelector("yt-formatted-string#video-title, h3 a, h3 yt-formatted-string");
     if (ytStr) {
-      title = ytStr.textContent || "";
+      title = ytStr.getAttribute("title") || ytStr.textContent || "";
+    }
+  }
+  // yt-lockup-view-model: title in metadata h3 a or aria-label
+  if (!title || title.trim().length < 3) {
+    const lockupMeta = card.querySelector("yt-lockup-metadata-view-model h3 a");
+    if (lockupMeta) {
+      title = lockupMeta.getAttribute("aria-label") || lockupMeta.textContent || "";
     }
   }
   title = (title || "").trim();
@@ -75,6 +84,13 @@ function extractVideoFromCard(card) {
     "#channel-name a",
     "#channel-name yt-formatted-string",
     ".ytd-channel-name",
+    "#byline a",                       // playlist panel renderer
+    "#byline yt-formatted-string",     // playlist panel renderer
+    "span#byline",                     // playlist panel renderer alt
+    "yt-lockup-metadata-view-model .yt-content-metadata-view-model-wiz__metadata-text a", // lockup sidebar
+    "yt-lockup-metadata-view-model a[href*='/@']", // lockup sidebar channel link
+    ".yt-content-metadata-view-model-wiz__metadata-text a", // lockup metadata
+    ".publisher",                      // generic fallback
   ]) {
     const el = card.querySelector(sel);
     if (el && el.textContent.trim()) { channel = el.textContent.trim(); break; }
@@ -82,7 +98,7 @@ function extractVideoFromCard(card) {
 
   let views = null;
   let postedAgo = null;
-  card.querySelectorAll("#metadata-line span, .inline-metadata-item").forEach((span) => {
+  card.querySelectorAll("#metadata-line span, .inline-metadata-item, .yt-content-metadata-view-model-wiz__metadata-text span").forEach((span) => {
     const txt = span.textContent.trim();
     if (/views?/i.test(txt) && !views) views = txt;
     else if (/ago|streamed|premiered/i.test(txt) && !postedAgo) postedAgo = txt;
@@ -93,6 +109,7 @@ function extractVideoFromCard(card) {
     "ytd-thumbnail-overlay-time-status-renderer span",
     "badge-shape .badge-shape-wiz__text",
     "#time-status span",
+    ".yt-thumbnail-overlay-badge-view-model .badge-shape-wiz__text", // lockup sidebar
   ]) {
     const el = card.querySelector(sel);
     if (el && el.textContent.trim()) { duration = el.textContent.trim(); break; }
@@ -190,6 +207,7 @@ function observeVideoCards() {
  */
 function scanAndRecordVisibleCards() {
   let found = 0;
+
   CARD_SELECTORS.forEach((sel) => {
     document.querySelectorAll(sel).forEach((card) => {
       if (!card.dataset.twintube) {
@@ -198,7 +216,8 @@ function scanAndRecordVisibleCards() {
       }
 
       const data = extractVideoFromCard(card);
-      if (!data || sentImpressions.has(data.videoId)) return;
+      if (!data) return;
+      if (sentImpressions.has(data.videoId)) return;
 
       // Skip the currently watched video — that's a click, not an impression
       if (data.videoId === currentWatchVideoId) return;
@@ -210,13 +229,13 @@ function scanAndRecordVisibleCards() {
         && rect.height > 0 && rect.width > 0;
 
       if (isVisible) {
-        // Record immediately — don't wait for flush
         queueEvent("impression", data);
         sentImpressions.add(data.videoId);
         found++;
       }
     });
   });
+
   if (found > 0) {
     console.debug(`[TwinTube] Recorded ${found} sidebar/visible impressions`);
   }
@@ -264,16 +283,28 @@ function checkUrlChange() {
   } else if (!videoId && currentWatchVideoId) {
     endCurrentWatch();
     sentImpressions.clear();
+    stopSidebarWatching();
   }
 }
 
 /**
- * After navigating to a watch page, scan for sidebar cards over 12 seconds.
+ * After navigating to a watch page, aggressively scan for sidebar cards.
+ * YouTube lazy-loads sidebar recommendations, so we scan repeatedly and
+ * also watch for new cards being added to the sidebar container.
  */
+let sidebarMutationObserver = null;
+let sidebarScrollHandler = null;
+
 function startSidebarScanning() {
   if (sidebarScanTimer) clearInterval(sidebarScanTimer);
+  stopSidebarWatching();
 
-  let scansRemaining = 6;
+  // Immediate first scan
+  observeVideoCards();
+  scanAndRecordVisibleCards();
+
+  // Then scan every 2s for 30 seconds (15 scans) to catch lazy-loaded cards
+  let scansRemaining = 15;
   sidebarScanTimer = setInterval(() => {
     observeVideoCards();
     scanAndRecordVisibleCards();
@@ -282,7 +313,60 @@ function startSidebarScanning() {
       clearInterval(sidebarScanTimer);
       sidebarScanTimer = null;
     }
-  }, 2000); // every 2s for 12s total
+  }, 2000);
+
+  // Watch the sidebar container for new cards being inserted
+  startSidebarWatching();
+}
+
+function startSidebarWatching() {
+  // Find the sidebar container and observe it for new children
+  const sidebarSelectors = [
+    "ytd-watch-next-secondary-results-renderer",
+    "#secondary-inner",
+    "#related",
+    "#items.ytd-watch-next-secondary-results-renderer",
+    "#secondary",
+  ];
+
+  for (const sel of sidebarSelectors) {
+    const container = document.querySelector(sel);
+    if (container) {
+      sidebarMutationObserver = new MutationObserver(() => {
+        observeVideoCards();
+        setTimeout(scanAndRecordVisibleCards, 500);
+      });
+      sidebarMutationObserver.observe(container, { childList: true, subtree: true });
+      console.debug(`[TwinTube] Watching sidebar via "${sel}"`);
+      break;
+    }
+  }
+
+  // If we didn't find a sidebar container yet, retry after a delay
+  if (!sidebarMutationObserver) {
+    setTimeout(() => {
+      if (!sidebarMutationObserver && window.location.href.includes("/watch")) {
+        startSidebarWatching();
+      }
+    }, 3000);
+  }
+
+  // Also listen for scroll (sidebar scrolls with page on most layouts)
+  sidebarScrollHandler = () => {
+    scanAndRecordVisibleCards();
+  };
+  window.addEventListener("scroll", sidebarScrollHandler, { passive: true });
+}
+
+function stopSidebarWatching() {
+  if (sidebarMutationObserver) {
+    sidebarMutationObserver.disconnect();
+    sidebarMutationObserver = null;
+  }
+  if (sidebarScrollHandler) {
+    window.removeEventListener("scroll", sidebarScrollHandler);
+    sidebarScrollHandler = null;
+  }
 }
 
 /**
