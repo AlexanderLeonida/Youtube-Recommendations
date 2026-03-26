@@ -1,11 +1,11 @@
 # TwinTube Vector - YouTube Recommendation Engine
 
-A production-grade deep learning recommendation system using a **two-tower neural network** architecture for personalized YouTube video recommendations. Collects browsing data via a Chrome extension and/or screen recording with OCR, then trains and serves recommendations with FAISS vector search.
+A production-grade deep learning recommendation system using a **two-tower neural network** architecture for personalized YouTube video recommendations. Learns from real user engagement signals — **click-through rate (CTR)** from impressions vs. clicks and **dwell time** (watch duration) — to predict which videos a user will actually watch. Collects browsing data via a Chrome extension and/or screen recording with OCR, then trains and serves recommendations with FAISS vector search.
 
 ## Key Features
 
 ### Data Collection
-- **Chrome Extension**: Tracks YouTube impressions, clicks, and watch time — primary data source for ML training
+- **Chrome Extension**: Tracks YouTube impressions, clicks, and watch duration — primary data source for CTR and dwell-time based ML training
 - **Screen Recording + OCR**: Captures YouTube browsing via DisplayMedia API with Tesseract OCR, LLM parsing (Llama GGUF), and HTML scraping
 - **YouTube Data API**: Trending, search, and related video discovery
 
@@ -14,8 +14,10 @@ A production-grade deep learning recommendation system using a **two-tower neura
   - User Tower: Attention-based sequence encoding of viewing history
   - Video Tower: Multi-modal feature fusion (visual, text, metadata)
   - Shared 256-dimensional embedding space with contrastive learning
+- **CTR + Dwell-Time Training**: Binary cross-entropy on impression/click pairs, weighted by watch duration completion ratio — longer watch = stronger positive signal
+- **Impression-Aware Ranking**: Videos shown 5+ times without a click are dropped and backfilled with fresh YouTube API discovery videos the user has never seen
 - **Multi-Stage Ranker**: Retrieval + re-ranking pipeline for recommendation quality
-- **Recall@K Evaluation**: Built-in Recall@K evaluation with a 68% Recall@100 target
+- **Model Evaluation Dashboard**: Live Recall@K, NDCG@K, MRR, Hit Rate, Coverage, and latency benchmarks in the admin panel (see [Admin Metrics Dashboard](#admin-metrics-dashboard))
 - **Model Quantization**: INT8 dynamic quantization with a 70% latency reduction target
 - **GPU Vector Search**: FAISS IVF-PQ index for million-scale retrieval
 
@@ -78,7 +80,7 @@ Two parallel data collection paths feed into the same MySQL database:
 ├── frontend/                       # Web Interface (React + TypeScript)
 │   └── src/
 │       ├── pages/MainApp.tsx       # Main UI — screen capture, video display
-│       ├── pages/AdminPage.tsx     # Admin/debug dashboard
+│       ├── pages/AdminPage.tsx     # Admin dashboard — video management + ML metrics
 │       └── services/api.ts         # Axios client (all calls → backend :4000)
 │
 ├── backend/                        # API Server (Node.js/Express, ES modules)
@@ -231,6 +233,17 @@ video_embedding = VideoTower(
 score = cosine_similarity(user_embedding, video_embedding)
 ```
 
+### Training Signals
+
+The model trains on real user engagement data collected by the Chrome extension:
+
+| Signal | How It's Used |
+|--------|---------------|
+| **Impressions** | Videos shown to the user in the YouTube feed — form negative samples when not clicked |
+| **Clicks (CTR)** | Videos the user chose to watch — positive training signal, weighted by frequency |
+| **Dwell Time** | Watch duration relative to video length — label = `0.5 + 0.5 * min(watch_dur / video_dur, 1.0)`. Longer watch = stronger positive |
+| **Impression Frequency** | Videos shown N times without a click get progressively stronger negative weight: `min(1.0 + 0.3 * (N - 1), 3.0)` |
+
 ### Training Metrics
 
 | Metric | Value |
@@ -240,6 +253,34 @@ score = cosine_similarity(user_embedding, video_embedding)
 | Recall@100 (Target) | 68% |
 | Embedding Dim | 256 |
 | Inference Latency (Target) | 12ms (p99) |
+
+### Admin Metrics Dashboard
+
+The admin panel (`/admin` → "Model Metrics" tab) provides a live evaluation dashboard. Click **Run Evaluation** to compute all metrics via leave-one-out on real browse data.
+
+#### Ranking Quality Metrics
+
+| Metric | What It Measures | How It's Computed |
+|--------|------------------|-------------------|
+| **Recall@K** | Fraction of relevant items found in top-K | For each user session, hold out the last click, retrieve top-K with remaining history, check if held-out item appears |
+| **NDCG@K** | Ranking quality — rewards relevant items placed higher | `1 / log2(rank + 1)` for the held-out item, normalized. 1.0 = perfect ranking |
+| **Hit Rate@K** | Fraction of users with at least one relevant item in top-K | Binary per-user: did the held-out click appear anywhere in top-K? |
+| **MRR** | How early the first relevant item appears | Average of `1 / rank` of the first relevant item across all users |
+| **Coverage** | Catalog diversity — fraction of videos that appear in any recommendation | `|recommended videos| / |catalog|`. Higher = less popularity bias |
+
+#### Latency Benchmarks
+
+| Metric | Target | Description |
+|--------|--------|-------------|
+| **P50 Latency** | < 8ms | Median end-to-end inference time |
+| **P95 Latency** | — | 95th percentile latency |
+| **P99 Latency** | < 12ms | Tail latency under load |
+
+#### Additional Dashboard Panels
+
+- **Training Loss Curve**: Per-epoch BCE loss plotted over training, showing convergence
+- **CTR Summary**: Overall click-through rate, total impressions, total clicks, unique videos in catalog
+- **Detailed Results Table**: All Recall@K, NDCG@K, and Hit Rate@K values at K = 5, 10, 20, 50
 
 ### Performance Optimizations
 
@@ -274,6 +315,7 @@ GET  /api/training-data       # Aggregated sessions for ML training
 POST /api/ml/train            # Trigger model training
 GET  /api/ml/train/status     # Training status
 POST /api/ml/recommend        # Get recommendations
+POST /api/ml/evaluate         # Run evaluation (Recall@K, NDCG, MRR, latency)
 GET  /api/ml/health           # ML service health
 ```
 
@@ -285,6 +327,7 @@ POST /batch_recommend         # Batch recommendations
 POST /recommend_from_history  # Recommendations from browsing history
 POST /train                   # Trigger training
 GET  /train/status            # Training status
+POST /evaluate                # Evaluation metrics (Recall@K, NDCG@K, MRR, latency)
 GET  /health                  # Health check
 GET  /metrics                 # Prometheus metrics
 ```
