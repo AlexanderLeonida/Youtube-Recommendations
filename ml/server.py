@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 import numpy as np
 
 from inference import RecommendationEngine, InferenceConfig
+from multi_stage_ranker import MultiStageRecommender, PipelineConfig, ReRankConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Global engine instance
 engine: Optional[RecommendationEngine] = None
+multi_stage: Optional[MultiStageRecommender] = None
 
 
 class UserFeatures(BaseModel):
@@ -51,6 +53,26 @@ class RecommendationResponse(BaseModel):
     scores: List[float]
     latency_ms: float
     cache_hit: bool
+
+
+class StageLatency(BaseModel):
+    stage1_ms: float
+    stage2_ms: float
+    stage3_ms: float
+    total_ms: float
+
+
+class MultiStageResponse(BaseModel):
+    """Response from the three-stage pipeline."""
+    video_ids: List[int]
+    scores: List[float]
+    latency: StageLatency
+
+
+class MultiStageRequest(BaseModel):
+    """Request for multi-stage recommendations."""
+    user_features: UserFeatures
+    top_k: int = Field(default=20, ge=1, le=200, description="Final result size")
 
 
 class HealthResponse(BaseModel):
@@ -76,8 +98,8 @@ class MetricsResponse(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup resources."""
-    global engine
-    
+    global engine, multi_stage
+
     logger.info("Starting TwinTube Vector inference server...")
     
     # Initialize config
@@ -100,7 +122,23 @@ async def lifespan(app: FastAPI):
         logger.info(f"Loaded index from {config.index_path}")
     else:
         logger.warning("No pre-built index found. Index must be built before serving.")
-    
+
+    # Initialize multi-stage pipeline
+    multi_stage = MultiStageRecommender(
+        PipelineConfig(
+            stage1_top_k=int(os.getenv('STAGE1_TOP_K', '1000')),
+            stage2_top_k=int(os.getenv('STAGE2_TOP_K', '100')),
+            final_top_k=int(os.getenv('FINAL_TOP_K', '20')),
+            scorer_embedding_dim=config.embedding_dim,
+            scorer_device=config.device,
+            rerank_config=ReRankConfig(
+                diversity_lambda=float(os.getenv('DIVERSITY_LAMBDA', '0.3')),
+            ),
+        ),
+        engine,
+    )
+    logger.info("Multi-stage pipeline initialized")
+
     logger.info("Server ready to serve requests")
     
     yield
@@ -212,6 +250,46 @@ async def get_recommendations(request: RecommendationRequest):
     except Exception as e:
         logger.error(f"Recommendation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recommend/multi_stage", response_model=MultiStageResponse)
+async def get_multi_stage_recommendations(request: MultiStageRequest):
+    """
+    Three-stage recommendation pipeline:
+      1. Candidate generation (two-tower + FAISS ANN) → ~1000
+      2. Cross-feature scoring → ~100
+      3. Diversity re-ranking → final top-k
+
+    Performance targets: P50 <8ms, P99 <12ms
+    """
+    if multi_stage is None:
+        raise HTTPException(status_code=503, detail="Multi-stage pipeline not initialized")
+
+    try:
+        user_features = {
+            "watch_history": request.user_features.watch_history,
+            "watch_times": request.user_features.watch_times,
+            "engagement": request.user_features.engagement,
+        }
+
+        result = multi_stage.recommend(user_features, top_k=request.top_k)
+
+        return MultiStageResponse(
+            video_ids=result["video_ids"],
+            scores=result["scores"],
+            latency=StageLatency(**result["latency"]),
+        )
+    except Exception as e:
+        logger.error(f"Multi-stage recommendation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/recommend/multi_stage/stats")
+async def multi_stage_stats():
+    """Per-stage latency percentiles for the multi-stage pipeline."""
+    if multi_stage is None:
+        raise HTTPException(status_code=503, detail="Multi-stage pipeline not initialized")
+    return multi_stage.get_latency_stats()
 
 
 @app.post("/batch_recommend")

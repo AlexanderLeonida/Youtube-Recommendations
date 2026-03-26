@@ -72,6 +72,20 @@ class InferenceConfig:
     embedding_dim: int = 256
     num_videos: int = 1_000_000
     nprobe: int = 64  # Number of clusters to search
+
+    # FAISS index type: 'auto', 'flat', 'ivfpq', 'ivfflat', 'hnsw'
+    # 'auto' picks based on num_videos (flat <100k, ivfpq >=100k)
+    index_type: str = 'auto'
+
+    # IVF parameters
+    ivf_nlist: int = 0  # 0 = auto (sqrt(n), capped at 4096)
+    pq_m: int = 32      # sub-quantizers for PQ
+    pq_nbits: int = 8
+
+    # HNSW parameters
+    hnsw_m: int = 32         # connections per layer
+    hnsw_ef_construction: int = 200  # build-time beam width
+    hnsw_ef_search: int = 128        # search-time beam width
     
     # Caching
     redis_host: str = 'localhost'
@@ -280,10 +294,26 @@ class GPUVectorIndex:
         self.video_ids = None
         self.gpu_resources = None
         
+    def _resolve_index_type(self, num_videos: int) -> str:
+        """Determine which FAISS index type to use."""
+        t = self.config.index_type.lower()
+        if t != 'auto':
+            return t
+        if num_videos < 100_000:
+            return 'flat'
+        return 'ivfpq'
+
     def build_index(self, embeddings: np.ndarray, video_ids: np.ndarray):
         """
         Build GPU-accelerated FAISS index.
-        
+
+        Supports multiple index types configured via InferenceConfig.index_type:
+          - 'flat':    Brute-force inner product (exact, highest recall)
+          - 'ivfflat': IVF with flat quantizer (good recall, moderate speed)
+          - 'ivfpq':   IVF with product quantization (fast, slight recall loss)
+          - 'hnsw':    Hierarchical NSW graph (fast, no training step)
+          - 'auto':    flat if <100k videos, ivfpq otherwise
+
         Args:
             embeddings: (num_videos, dim) Video embeddings
             video_ids: (num_videos,) Video IDs
@@ -293,39 +323,57 @@ class GPUVectorIndex:
             self.embeddings = embeddings.astype(np.float32)
             self.video_ids = video_ids
             return
-        
+
         num_videos, dim = embeddings.shape
         embeddings = embeddings.astype(np.float32)
-        
+
         logger.info(f"Building FAISS index for {num_videos:,} videos...")
         start_time = time.time()
-        
+
         # Normalize embeddings for cosine similarity
         faiss.normalize_L2(embeddings)
-        
-        # Choose index type based on scale
-        if num_videos < 100_000:
-            # Flat index for small datasets
+
+        index_type = self._resolve_index_type(num_videos)
+        logger.info(f"Index type: {index_type}")
+
+        if index_type == 'flat':
             self.index = faiss.IndexFlatIP(dim)
-        else:
-            # IVF-PQ for large datasets
-            nlist = min(4096, int(np.sqrt(num_videos)))
-            m = 32  # Number of sub-quantizers
-            nbits = 8
-            
+
+        elif index_type == 'ivfflat':
+            nlist = self.config.ivf_nlist or min(4096, int(np.sqrt(num_videos)))
             quantizer = faiss.IndexFlatIP(dim)
-            self.index = faiss.IndexIVFPQ(quantizer, dim, nlist, m, nbits)
-            
-            # Train index
-            train_size = min(num_videos, 100_000)
-            train_indices = np.random.choice(num_videos, train_size, replace=False)
-            self.index.train(embeddings[train_indices])
-        
+            self.index = faiss.IndexIVFFlat(quantizer, dim, nlist, faiss.METRIC_INNER_PRODUCT)
+            train_size = min(num_videos, max(nlist * 40, 100_000))
+            train_idx = np.random.choice(num_videos, train_size, replace=False)
+            self.index.train(embeddings[train_idx])
+
+        elif index_type == 'ivfpq':
+            nlist = self.config.ivf_nlist or min(4096, int(np.sqrt(num_videos)))
+            quantizer = faiss.IndexFlatIP(dim)
+            self.index = faiss.IndexIVFPQ(
+                quantizer, dim, nlist, self.config.pq_m, self.config.pq_nbits
+            )
+            train_size = min(num_videos, max(nlist * 40, 100_000))
+            train_idx = np.random.choice(num_videos, train_size, replace=False)
+            self.index.train(embeddings[train_idx])
+
+        elif index_type == 'hnsw':
+            self.index = faiss.IndexHNSWFlat(dim, self.config.hnsw_m)
+            self.index.hnsw.efConstruction = self.config.hnsw_ef_construction
+            self.index.hnsw.efSearch = self.config.hnsw_ef_search
+
+        else:
+            raise ValueError(f"Unknown index_type: {index_type}")
+
         # Add vectors to index
         self.index.add(embeddings)
-        
-        # Move to GPU if available
-        if self.config.use_gpu_index and torch.cuda.is_available():
+
+        # Move to GPU if available (HNSW is CPU-only in FAISS)
+        if (
+            self.config.use_gpu_index
+            and torch.cuda.is_available()
+            and index_type != 'hnsw'
+        ):
             try:
                 self.gpu_resources = faiss.StandardGpuResources()
                 self.index = faiss.index_cpu_to_gpu(
@@ -334,15 +382,15 @@ class GPUVectorIndex:
                 logger.info("Index moved to GPU")
             except Exception as e:
                 logger.warning(f"GPU index failed: {e}. Using CPU.")
-        
+
         # Set search parameters
         if hasattr(self.index, 'nprobe'):
             self.index.nprobe = self.config.nprobe
-        
+
         self.video_ids = video_ids
-        
+
         build_time = time.time() - start_time
-        logger.info(f"Index built in {build_time:.2f}s")
+        logger.info(f"Index built in {build_time:.2f}s ({index_type}, {num_videos:,} vectors)")
     
     def save(self, path: str):
         """Save index to disk."""
