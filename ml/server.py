@@ -468,6 +468,14 @@ async def recommend_from_history(req: BrowseRecommendRequest):
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Failed to fetch browse history: {e}")
 
+    # Fetch ALL clicked video IDs for filtering (no limit)
+    try:
+        excl_resp = http_requests.get(f"{backend_url}/api/clicked-video-ids", timeout=10)
+        excl_resp.raise_for_status()
+        all_clicked_ids = set(excl_resp.json().get("video_ids", []))
+    except Exception:
+        all_clicked_ids = None  # Fall back to limited set below
+
     # Fetch impressions for engagement-aware re-scoring
     try:
         imp_params = {"type": "impression", "limit": 500}
@@ -486,7 +494,11 @@ async def recommend_from_history(req: BrowseRecommendRequest):
         impressions = [i for i in impressions if i["session_id"] == req.session_id]
 
     # Track clicked video IDs and impression counts for re-scoring
-    clicked_video_ids = {c.get("video_id") for c in clicks if c.get("video_id")}
+    # Use the full set from dedicated endpoint if available, otherwise fall back to limited clicks
+    if all_clicked_ids is not None:
+        clicked_video_ids = all_clicked_ids
+    else:
+        clicked_video_ids = {c.get("video_id") for c in clicks if c.get("video_id")}
     impression_counts: Dict[str, int] = {}
     for imp in impressions:
         vid = imp.get("video_id", "")

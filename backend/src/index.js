@@ -233,6 +233,15 @@ app.post('/api/events', (req, res) => {
   });
 });
 
+// Get all distinct clicked video IDs (for recommendation filtering)
+app.get('/api/clicked-video-ids', (req, res) => {
+  const sql = 'SELECT DISTINCT video_id FROM browse_events WHERE event_type = ?';
+  db.query(sql, ['click'], (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    res.json({ video_ids: results.map((r) => r.video_id) });
+  });
+});
+
 // Get browsing events (for dashboard / ML training data export)
 app.get('/api/events', (req, res) => {
   const type = req.query.type; // optional filter: impression, click, watch_end
