@@ -33,6 +33,9 @@ interface CTRStats {
   unique_videos: number;
 }
 
+// Stable session ID for recommendation clicks from this frontend session
+const REC_SESSION_ID = `rec_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
 export default function MainApp() {
   const navigate = useNavigate();
   const [status, setStatus] = useState("Checking connection...");
@@ -117,6 +120,19 @@ export default function MainApp() {
       setTrainResult(`Training failed: ${err.response?.data?.detail || err.response?.data?.error || err.message}`);
       setIsTraining(false);
     }
+  };
+
+  const handleRecClick = (rec: Recommendation) => {
+    api.postEvents([{
+      type: "click",
+      sessionId: REC_SESSION_ID,
+      videoId: rec.video_id,
+      title: rec.title || null,
+      channel: rec.channel || null,
+      views: rec.views || null,
+      duration: rec.duration || null,
+      url: rec.youtube_url,
+    }]).catch(() => {});
   };
 
   const handleRecommend = async () => {
@@ -284,6 +300,7 @@ export default function MainApp() {
                   href={rec.youtube_url || "#"}
                   target="_blank"
                   rel="noopener noreferrer"
+                  onClick={() => handleRecClick(rec)}
                   style={{ textDecoration: "none", color: "inherit" }}
                 >
                   <div style={{

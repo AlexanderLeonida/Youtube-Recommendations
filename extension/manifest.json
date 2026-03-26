@@ -1,13 +1,23 @@
 {
   "manifest_version": 3,
   "name": "TwinTube Tracker",
-  "version": "1.0",
+  "version": "1.1",
   "description": "Tracks YouTube browsing for personalized recommendations",
   "permissions": ["activeTab"],
-  "host_permissions": ["https://www.youtube.com/*"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://m.youtube.com/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
   "content_scripts": [
     {
-      "matches": ["https://www.youtube.com/*"],
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://youtube.com/*",
+        "https://m.youtube.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

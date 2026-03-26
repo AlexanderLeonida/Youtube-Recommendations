@@ -9,6 +9,14 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Also parse text/plain as JSON — sendBeacon fallback sends JSON with text/plain content type
+app.use(express.text({ type: 'text/plain' }));
+app.use((req, res, next) => {
+  if (typeof req.body === 'string' && req.headers['content-type'] === 'text/plain') {
+    try { req.body = JSON.parse(req.body); } catch {}
+  }
+  next();
+});
 
 // MySQL connection pool
 const db = mysql.createPool({

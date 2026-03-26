@@ -43,4 +43,8 @@ export const api = {
 
   getMLHealth: () =>
     axios.get(`${API_BASE_URL}/api/ml/health`),
+
+  // Send browse events (used to record recommendation clicks)
+  postEvents: (events: Record<string, unknown>[]) =>
+    axios.post(`${API_BASE_URL}/api/events`, { events }),
 };

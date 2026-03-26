@@ -22,7 +22,7 @@ let watchStartTime = null;
 let lastCheckedUrl = null;
 let sidebarScanTimer = null;
 let previousWatchTitle = null;          // title of the video we just left
-let exitFlushed = false;               // guard against duplicate flush on exit
+let destroyFlushed = false;            // guard: only flush watch_end once on page destroy
 
 // ── Video card selectors (all page types) ─────────────────────────────────
 
@@ -261,11 +261,14 @@ function endCurrentWatch() {
 
 function checkUrlChange() {
   const url = window.location.href;
-  if (url === lastCheckedUrl) return;
-  lastCheckedUrl = url;
-
   const match = url.match(/[?&]v=([a-zA-Z0-9_-]{11})/);
   const videoId = match ? match[1] : null;
+
+  // Compare by path + video ID, not full URL — YouTube updates query params
+  // (like &t=) while watching, which doesn't constitute a real navigation.
+  const pageKey = videoId || url.split("?")[0];
+  if (pageKey === lastCheckedUrl) return;
+  lastCheckedUrl = pageKey;
 
   if (videoId && videoId !== currentWatchVideoId) {
     endCurrentWatch();
@@ -455,13 +458,36 @@ async function flushEvents() {
 // ── Reliable exit flushing ─────────────────────────────────────────────────
 
 /**
- * Flush current watch state and all queued events via sendBeacon.
- * Called from visibilitychange:hidden, pagehide, and beforeunload.
- * Uses a guard flag so only the first one to fire actually sends.
+ * Send all queued events immediately via keepalive fetch (sendBeacon fallback).
+ * Safe to call anytime — just drains the queue without creating new events.
  */
-function flushOnExit() {
-  if (exitFlushed) return;
-  exitFlushed = true;
+function sendQueue() {
+  if (eventQueue.length === 0) return;
+  const payload = JSON.stringify({ events: eventQueue });
+  eventQueue = [];
+  try {
+    fetch(`${BACKEND_URL}/api/events`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload,
+      keepalive: true,
+    }).catch(() => {});
+  } catch {
+    navigator.sendBeacon(
+      `${BACKEND_URL}/api/events`,
+      new Blob([payload], { type: "text/plain" })
+    );
+  }
+}
+
+/**
+ * Called ONLY when the page is being destroyed (pagehide / beforeunload).
+ * Creates a final watch_end event and flushes everything.
+ * NOT called on tab switch — that just calls sendQueue().
+ */
+function flushOnDestroy() {
+  if (destroyFlushed) return;
+  destroyFlushed = true;
 
   if (currentWatchVideoId && watchStartTime) {
     const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
@@ -470,14 +496,10 @@ function flushOnExit() {
     if (watchDurationSec > 0) {
       queueEvent("watch_end", { videoId: currentWatchVideoId, watchDurationSec, title, channel });
     }
+    currentWatchVideoId = null;
+    watchStartTime = null;
   }
-  if (eventQueue.length > 0) {
-    navigator.sendBeacon(
-      `${BACKEND_URL}/api/events`,
-      new Blob([JSON.stringify({ events: eventQueue })], { type: "application/json" })
-    );
-    eventQueue = [];
-  }
+  sendQueue();
 }
 
 // ── MutationObserver for dynamic content ───────────────────────────────────
@@ -497,7 +519,6 @@ const domObserver = new MutationObserver(() => {
 function init() {
   console.log("[TwinTube] Tracker loaded, session:", SESSION_ID);
 
-  lastCheckedUrl = window.location.href;
   observeVideoCards();
   checkUrlChange();
 
@@ -512,14 +533,25 @@ function init() {
     }
   }, SEND_INTERVAL_MS);
 
-  // Flush watch state on exit — visibilitychange:hidden is the most reliable
-  // "last chance" event across all browsers. pagehide and beforeunload are backups.
-  // The exitFlushed flag ensures only the first handler to fire actually sends.
-  window.addEventListener("pagehide", () => flushOnExit());
-  window.addEventListener("beforeunload", () => flushOnExit());
+  // Page destruction: create final watch_end + flush queue.
+  // pagehide with persisted=false means the page is truly being discarded (tab close).
+  // pagehide with persisted=true means bfcache (tab switch) — just drain queue.
+  // beforeunload fires on tab close / window close / hard navigation — NOT on tab switch.
+  // This is the primary "page is going away" handler.
+  window.addEventListener("beforeunload", () => flushOnDestroy());
+  // pagehide is a backup. persisted=true means bfcache (just drain queue).
+  window.addEventListener("pagehide", (e) => {
+    if (e.persisted) {
+      sendQueue();
+    } else {
+      flushOnDestroy();
+    }
+  });
 
-  // yt-navigate-start: capture watch_end BEFORE navigation
+  // yt-navigate-start: capture watch_end BEFORE SPA navigation changes the DOM.
+  // Guard: ignore if tab is hidden — YouTube can fire spurious navigation events on tab switch.
   window.addEventListener("yt-navigate-start", () => {
+    if (document.visibilityState === "hidden") return;
     if (currentWatchVideoId && watchStartTime) {
       const watchDurationSec = Math.round((Date.now() - watchStartTime) / 1000);
       const title = extractWatchPageTitle();
@@ -539,13 +571,12 @@ function init() {
     setTimeout(observeVideoCards, 500);
   });
 
-  // Tab hidden (close, switch, minimize) — most reliable exit event
-  // Tab visible (return) — reset guard and resume tracking
+  // Tab hidden (switch, minimize) — just drain event queue, do NOT create watch_end
+  // Tab visible (return) — resume tracking
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      flushOnExit();
+      sendQueue();
     } else if (document.visibilityState === "visible") {
-      exitFlushed = false;
       checkUrlChange();
       observeVideoCards();
       scanAndRecordVisibleCards();
