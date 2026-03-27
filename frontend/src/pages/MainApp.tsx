@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../services/api";
 
@@ -42,6 +42,9 @@ export default function MainApp() {
   const [events, setEvents] = useState<BrowseEvent[]>([]);
   const [stats, setStats] = useState({ impressions: 0, clicks: 0, sessions: 0 });
   const [activeTab, setActiveTab] = useState<"live" | "clicks" | "recommendations">("live");
+  const [page, setPage] = useState(0);
+  const [totalEvents, setTotalEvents] = useState(0);
+  const PAGE_SIZE = 50;
 
   // ML state
   const [isTraining, setIsTraining] = useState(false);
@@ -65,24 +68,49 @@ export default function MainApp() {
       .catch(() => {});
   }, []);
 
-  // Poll events
-  const loadData = () => {
-    api.getEvents(undefined, 200).then((res) => {
-      const evts = res.data.events || [];
-      setEvents(evts);
+  // Refs so the polling interval always reads current tab/page
+  const activeTabRef = useRef(activeTab);
+  activeTabRef.current = activeTab;
+  const pageRef = useRef(page);
+  pageRef.current = page;
+
+  // Load true counts from DB (not limited by page size)
+  const loadStats = () => {
+    api.getEventStats().then((res) => {
       setStats({
-        impressions: evts.filter((e: BrowseEvent) => e.event_type === "impression").length,
-        clicks: evts.filter((e: BrowseEvent) => e.event_type === "click").length,
-        sessions: new Set(evts.map((e: BrowseEvent) => e.session_id)).size,
+        impressions: res.data.impressions,
+        clicks: res.data.clicks,
+        sessions: res.data.sessions,
       });
     }).catch(() => {});
+  };
+
+  // Load paginated events for display
+  const loadEvents = (tab: string, pageNum: number) => {
+    const eventType = tab === "clicks" ? "click" : undefined;
+    api.getEvents(eventType, PAGE_SIZE, pageNum * PAGE_SIZE).then((res) => {
+      setEvents(res.data.events || []);
+      setTotalEvents(res.data.total);
+    }).catch(() => {});
+  };
+
+  const loadData = () => {
+    loadStats();
+    loadEvents(activeTabRef.current, pageRef.current);
   };
 
   useEffect(() => {
     loadData();
     const interval = setInterval(loadData, 5000);
     return () => clearInterval(interval);
+  // eslint-disable-next-line
   }, []);
+
+  // Reload events when page or tab changes
+  useEffect(() => {
+    loadEvents(activeTab, page);
+  // eslint-disable-next-line
+  }, [page, activeTab]);
 
   // ── Actions ──────────────────────────────────────────────────────────────
 
@@ -153,10 +181,7 @@ export default function MainApp() {
     }
   };
 
-  const filteredEvents =
-    activeTab === "clicks"
-      ? events.filter((e) => e.event_type === "click")
-      : events;
+  const totalPages = Math.max(1, Math.ceil(totalEvents / PAGE_SIZE));
 
   const tabs = ["live", "clicks", "recommendations"] as const;
 
@@ -265,7 +290,7 @@ export default function MainApp() {
         {tabs.map((tab, i) => (
           <button
             key={tab}
-            onClick={() => setActiveTab(tab)}
+            onClick={() => { setActiveTab(tab); setPage(0); }}
             style={{
               padding: "8px 20px",
               backgroundColor: activeTab === tab ? "#333" : "#e0e0e0",
@@ -349,13 +374,13 @@ export default function MainApp() {
         <div>
           <h2>
             {activeTab === "live" ? "All Events" : "Clicked Videos"}{" "}
-            ({filteredEvents.length})
+            ({totalEvents})
           </h2>
-          {filteredEvents.length === 0 ? (
+          {events.length === 0 ? (
             <p>No events yet. Browse YouTube with the extension installed.</p>
           ) : (
             <div style={{ display: "grid", gap: "10px" }}>
-              {filteredEvents.map((event) => (
+              {events.map((event) => (
                 <div
                   key={event.id}
                   style={{
@@ -397,6 +422,39 @@ export default function MainApp() {
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+          {/* Pagination controls */}
+          {totalPages > 1 && (
+            <div style={{
+              display: "flex", justifyContent: "center", alignItems: "center",
+              gap: "15px", marginTop: "20px", padding: "10px",
+            }}>
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                style={{
+                  padding: "8px 16px", border: "1px solid #ccc", borderRadius: "4px",
+                  cursor: page === 0 ? "not-allowed" : "pointer",
+                  backgroundColor: page === 0 ? "#f5f5f5" : "white",
+                }}
+              >
+                Previous
+              </button>
+              <span style={{ fontSize: "14px", color: "#666" }}>
+                Page {page + 1} of {totalPages}
+              </span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                disabled={page >= totalPages - 1}
+                style={{
+                  padding: "8px 16px", border: "1px solid #ccc", borderRadius: "4px",
+                  cursor: page >= totalPages - 1 ? "not-allowed" : "pointer",
+                  backgroundColor: page >= totalPages - 1 ? "#f5f5f5" : "white",
+                }}
+              >
+                Next
+              </button>
             </div>
           )}
         </div>

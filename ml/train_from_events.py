@@ -323,7 +323,7 @@ class CTRDataset(Dataset):
 def fetch_sessions(backend_url: str = BACKEND_URL) -> List[Dict]:
     """Fetch browse events and group into sessions with click sequences."""
     try:
-        resp = requests.get(f"{backend_url}/api/events", params={"limit": 5000}, timeout=10)
+        resp = requests.get(f"{backend_url}/api/events", params={"limit": 50000}, timeout=30)
         resp.raise_for_status()
         events = resp.json().get("events", [])
     except Exception as e:

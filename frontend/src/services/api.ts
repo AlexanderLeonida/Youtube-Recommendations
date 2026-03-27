@@ -14,10 +14,14 @@ export const api = {
   deleteVideo: (id: number) =>
     axios.delete(`${API_BASE_URL}/api/videos/${id}`),
 
-  // Browse events from Chrome extension
-  getEvents: (type?: string, limit?: number) =>
+  // True event counts from the database (no LIMIT)
+  getEventStats: () =>
+    axios.get(`${API_BASE_URL}/api/events/stats`),
+
+  // Browse events from Chrome extension (paginated)
+  getEvents: (type?: string, limit?: number, offset?: number) =>
     axios.get(`${API_BASE_URL}/api/events`, {
-      params: { type, limit: limit || 500 },
+      params: { type, limit: limit || 500, offset: offset || 0 },
     }),
 
   // ML training data: sessions with impressions, clicks, watch times

@@ -242,24 +242,59 @@ app.get('/api/clicked-video-ids', (req, res) => {
   });
 });
 
+// Get true event counts from the database (no LIMIT)
+app.get('/api/events/stats', (req, res) => {
+  const sql = `
+    SELECT
+      COUNT(*) AS total,
+      SUM(event_type = 'impression') AS impressions,
+      SUM(event_type = 'click') AS clicks,
+      SUM(event_type = 'watch_end') AS watch_ends,
+      COUNT(DISTINCT session_id) AS sessions
+    FROM browse_events
+  `;
+  db.query(sql, (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    const row = results[0];
+    res.json({
+      total: row.total,
+      impressions: row.impressions,
+      clicks: row.clicks,
+      watch_ends: row.watch_ends,
+      sessions: row.sessions,
+    });
+  });
+});
+
 // Get browsing events (for dashboard / ML training data export)
 app.get('/api/events', (req, res) => {
   const type = req.query.type; // optional filter: impression, click, watch_end
-  const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
+  const limit = Math.min(parseInt(req.query.limit) || 500, 50000);
+  const offset = Math.max(parseInt(req.query.offset) || 0, 0);
 
   let sql = 'SELECT * FROM browse_events';
+  let countSql = 'SELECT COUNT(*) AS total FROM browse_events';
   const params = [];
+  const countParams = [];
 
   if (type) {
     sql += ' WHERE event_type = ?';
+    countSql += ' WHERE event_type = ?';
     params.push(type);
+    countParams.push(type);
   }
-  sql += ' ORDER BY created_at DESC LIMIT ?';
-  params.push(limit);
+  sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
+  params.push(limit, offset);
 
-  db.query(sql, params, (err, results) => {
+  // Run both queries: total count + paginated results
+  db.query(countSql, countParams, (err, countResults) => {
     if (err) return res.status(500).json({ error: err.message });
-    res.json({ events: results, count: results.length });
+    const total = countResults[0].total;
+
+    db.query(sql, params, (err2, results) => {
+      if (err2) return res.status(500).json({ error: err2.message });
+      res.json({ events: results, count: results.length, total, offset, limit });
+    });
   });
 });
 
@@ -281,7 +316,7 @@ app.get('/api/training-data', (req, res) => {
     ORDER BY MIN(created_at) DESC
     LIMIT ?
   `;
-  const limit = Math.min(parseInt(req.query.limit) || 500, 5000);
+  const limit = Math.min(parseInt(req.query.limit) || 500, 50000);
 
   db.query(sql, [limit], (err, results) => {
     if (err) return res.status(500).json({ error: err.message });
